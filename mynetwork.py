@@ -296,7 +296,7 @@ class MyResNet(nn.Module):
         return self._forward_impl(x)
 
 class MyResNetRGBD(nn.Module):
-    def __init__(self):
+    def __init__(self, ingredients_dim: int = 255):
         super(MyResNetRGBD, self).__init__()
         self.model_rgb = MyResNet(Bottleneck, [3, 4, 23, 3])  # 这里具体的参数参考库中源代码
         self.model_rgb.load_state_dict(torch.load('food2k_resnet101_0.0001.pth'), strict=False)
@@ -305,8 +305,11 @@ class MyResNetRGBD(nn.Module):
         self.model_depth.load_state_dict(torch.load('food2k_resnet101_0.0001.pth'), strict=False)
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        #self.fc1 = nn.Linear(1024, 256) #
-        self.fc1 = nn.Linear(512, 256)  #
+        self.ingredients_dim = int(ingredients_dim)
+        self.ingredients_fc1 = nn.Linear(self.ingredients_dim, 256)
+        self.ingredients_fc2 = nn.Linear(256, 512)  # attention weights for 512-D visual vector (after GAP)
+        self.fusion_fc = nn.Linear(512 + 256, 256)
+
         self.calorie = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
         self.mass = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
         self.fat = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
@@ -328,7 +331,7 @@ class MyResNetRGBD(nn.Module):
         self.con2d_t = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, padding=1, bias=True)
         self.fc_t = nn.Linear(512,512)
 
-    def forward(self, x_rgb, x_depth):
+    def forward(self, x_rgb, x_depth, ingredients_vec):
         x_fea = self.model_rgb.conv1(x_rgb)
         x_fea = self.model_rgb.bn1(x_fea)
         x_fea = self.model_rgb.relu(x_fea)
@@ -376,7 +379,7 @@ class MyResNetRGBD(nn.Module):
         rgb_fea_t = self.con2d_t(rgb_fea_cat)
         rgb_fea_t = self.relu(rgb_fea_t)
         rgb_fea_t = self.avgpool(rgb_fea_t)
-        rgb_fea_t = torch.squeeze(rgb_fea_t)
+        rgb_fea_t = torch.flatten(rgb_fea_t, 1)
         rgb_fea_t = self.fc_t(rgb_fea_t)
         #rgb_fea_t /= rgb_fea_t.norm(dim=1, keepdim=True)
         #l3_fea = self.encoder_l3(x)
@@ -410,6 +413,106 @@ class MyResNetRGBD(nn.Module):
         #rgbd_fea = rgb_fea + depth_fea
         #rgbd_fea = torch.cat((rgb_fea, depth_fea), dim=1)
 
+        visual_vec = torch.flatten(rgb_fea, 1)  # (B, 512)
+        if isinstance(ingredients_vec, torch.Tensor) and ingredients_vec.dim() == 1:
+            ingredients_vec = ingredients_vec.view(1, -1)
+        ingredients_hidden = F.relu(self.ingredients_fc1(ingredients_vec.float()))  # (B, 256)
+        attn = torch.sigmoid(self.ingredients_fc2(ingredients_hidden))  # (B, 512)
+        visual_weighted = visual_vec * attn
+        fused = torch.cat([visual_weighted, ingredients_hidden], dim=1)  # (B, 768)
+        embedding = F.relu(self.fusion_fc(fused))  # (B, 256)
+        results = []
+        results.append(self.calorie(embedding).squeeze())
+        results.append(self.mass(embedding).squeeze())
+        results.append(self.fat(embedding).squeeze())
+        results.append(self.carb(embedding).squeeze())
+        results.append(self.protein(embedding).squeeze())
+        return results
+
+
+class MyResNetRGBDLegacy(nn.Module):
+    """
+    Legacy IMIR-Net RGB-D model (no ingredient-as-input fusion).
+    Use this to evaluate older checkpoints trained without ingredients gating.
+    """
+
+    def __init__(self):
+        super(MyResNetRGBDLegacy, self).__init__()
+        self.model_rgb = MyResNet(Bottleneck, [3, 4, 23, 3])
+        self.model_rgb.load_state_dict(torch.load('food2k_resnet101_0.0001.pth'), strict=False)
+
+        self.model_depth = MyResNet(Bottleneck, [3, 4, 23, 3])
+        self.model_depth.load_state_dict(torch.load('food2k_resnet101_0.0001.pth'), strict=False)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc1 = nn.Linear(512, 256)
+        self.calorie = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
+        self.mass = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
+        self.fat = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
+        self.carb = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
+        self.protein = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
+
+        self.encoder_l3_rgb = DilatedEncoder(in_channels=1024)
+        self.encoder_l4_rgb = DilatedEncoder(in_channels=2048)
+
+        # Present in some legacy checkpoints (even if not used in forward).
+        self.encoder_l3_depth = DilatedEncoder(in_channels=1024)
+        self.encoder_l4_depth = DilatedEncoder(in_channels=2048)
+
+        self.CA_SA_Enhance_3 = CA_SA_Enhance(2048)
+        self.CA_SA_Enhance_4 = CA_SA_Enhance(4096)
+
+        self.con2d = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, padding=1, bias=True)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.con2d_t = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, padding=1, bias=True)
+        self.fc_t = nn.Linear(512, 512)
+
+    def forward(self, x_rgb, x_depth):
+        x_fea = self.model_rgb.conv1(x_rgb)
+        x_fea = self.model_rgb.bn1(x_fea)
+        x_fea = self.model_rgb.relu(x_fea)
+        x_fea = self.model_rgb.maxpool(x_fea)
+
+        x_fea = self.model_rgb.layer1(x_fea)
+        x_fea = self.model_rgb.layer2(x_fea)
+        l3_fea_rgb = self.model_rgb.layer3(x_fea)
+
+        x_fea_depth = self.model_depth.conv1(x_depth)
+        x_fea_depth = self.model_depth.bn1(x_fea_depth)
+        x_fea_depth = self.model_depth.relu(x_fea_depth)
+        x_fea_depth = self.model_depth.maxpool(x_fea_depth)
+
+        x_fea_depth = self.model_depth.layer1(x_fea_depth)
+        x_fea_depth = self.model_depth.layer2(x_fea_depth)
+        l3_fea_depth = self.model_depth.layer3(x_fea_depth)
+
+        l3_fea_depth_rgb = self.CA_SA_Enhance_3(l3_fea_depth, l3_fea_rgb)
+        l3_fea_depth = l3_fea_depth + l3_fea_depth_rgb
+
+        l4_fea_depth = self.model_depth.layer4(l3_fea_depth)
+        l4_fea_rgb = self.model_rgb.layer4(l3_fea_rgb)
+
+        l4_fea_rgb_depth = self.CA_SA_Enhance_4(l4_fea_rgb, l4_fea_depth)
+        l4_fea_rgb = l4_fea_rgb + l4_fea_rgb_depth
+
+        l3_fea_rgb_dilate = self.encoder_l3_rgb(l3_fea_rgb)
+        l4_fea_rgb_dilate = self.encoder_l4_rgb(l4_fea_rgb)
+        l4_fea_rgb_dilate_up = torch.nn.functional.interpolate(
+            l4_fea_rgb_dilate, scale_factor=2, mode='bilinear', align_corners=False
+        )
+        rgb_fea_cat = torch.cat((l3_fea_rgb_dilate, l4_fea_rgb_dilate_up), dim=1)
+
+        rgb_fea = self.con2d(rgb_fea_cat)
+        rgb_fea = self.relu(rgb_fea)
+        rgb_fea = self.avgpool(rgb_fea)
+
+        rgb_fea_t = self.con2d_t(rgb_fea_cat)
+        rgb_fea_t = self.relu(rgb_fea_t)
+        rgb_fea_t = self.avgpool(rgb_fea_t)
+        rgb_fea_t = torch.flatten(rgb_fea_t, 1)
+        rgb_fea_t = self.fc_t(rgb_fea_t)
+
         embedding = torch.flatten(rgb_fea, 1)
         embedding = self.fc1(embedding)
         embedding = F.relu(embedding)
@@ -420,8 +523,3 @@ class MyResNetRGBD(nn.Module):
         results.append(self.carb(embedding).squeeze())
         results.append(self.protein(embedding).squeeze())
         return results, rgb_fea_t
-
-
-
-
-

@@ -1,15 +1,17 @@
 from __future__ import print_function
 
 import argparse
-import os
 import csv
+import json
+import os
+import statistics
 from collections import OrderedDict
 
 import numpy as np
 import torch
-from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from tqdm import tqdm
 
 from mydataset import Nutrition_RGBD
 from mynetwork import MyResNetRGBD, MyResNetRGBDLegacy
@@ -63,12 +65,16 @@ def load_checkpoint(model, checkpoint_path, device):
             model.model_rgb.load_state_dict(state_dict, strict=False)
             model.model_depth.load_state_dict(state_dict, strict=False)
             print(f"[INFO] Loaded backbone weights into model_rgb/model_depth from: {checkpoint_path}")
-            print("[WARN] This checkpoint does not include the IMIR-Net regression head; use ./saved/ckpt_best.pth for meaningful nutrition predictions.")
+            print(
+                "[WARN] This checkpoint does not include the IMIR-Net regression head; use ./saved/ckpt_best.pth for meaningful nutrition predictions."
+            )
             return
 
         # Fallback: try to load into the full model.
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        print(f"[INFO] Loaded checkpoint with strict=False from: {checkpoint_path} (missing={len(missing)} unexpected={len(unexpected)})")
+        print(
+            f"[INFO] Loaded checkpoint with strict=False from: {checkpoint_path} (missing={len(missing)} unexpected={len(unexpected)})"
+        )
         return
 
     raise ValueError(f"Unrecognized checkpoint format at: {checkpoint_path}")
@@ -107,7 +113,6 @@ def build_model_for_checkpoint(args, device):
         ingredients_dim = inferred_dim if inferred_dim is not None else (255 if args.ingredients_mode == "binary255" else 512)
         model = MyResNetRGBD(ingredients_dim=ingredients_dim).to(device)
 
-    # load weights
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         payload = _strip_module_prefix(ckpt["state_dict"])
     else:
@@ -117,7 +122,6 @@ def build_model_for_checkpoint(args, device):
         model.load_state_dict(payload, strict=True)
     except RuntimeError as e:
         print(f"[WARN] load_state_dict(strict=True) failed: {e}")
-        # Remove incompatible shapes (strict=False still errors on size mismatch).
         model_sd = model.state_dict()
         filtered = {k: v for k, v in payload.items() if k in model_sd and getattr(v, "shape", None) == getattr(model_sd[k], "shape", None)}
         missing, unexpected = model.load_state_dict(filtered, strict=False)
@@ -137,6 +141,7 @@ def main():
     parser.add_argument("--data_root", type=str, required=True, help="Dataset root containing imagery/")
     parser.add_argument("--checkpoint", type=str, default="./saved/ckpt_best.pth", help="Path to checkpoint .pth")
     parser.add_argument("--out_csv", type=str, default="", help="If set, write dish-level predictions CSV")
+    parser.add_argument("--out_json", type=str, default="", help="If set, write MAE/MAE%% stats as JSON")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument(
@@ -161,21 +166,24 @@ def main():
     )
     args = parser.parse_args()
 
-    test_transform = transforms.Compose([
-        transforms.Resize((416, 416)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
+    test_transform = transforms.Compose(
+        [
+            transforms.Resize((416, 416)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
 
     nutrition_rgbd_ims_root = os.path.join(args.data_root, "imagery")
     nutrition_test_txt = os.path.join(args.data_root, "imagery", "rgbd_test_processed1_refine.txt")  # depth_color.png
-    nutrition_test_rgbd_txt = os.path.join(args.data_root, "imagery", "rgb_in_overhead_test_processed1_refine.txt")  # rgb.png
+    nutrition_test_rgbd_txt = os.path.join(
+        args.data_root, "imagery", "rgb_in_overhead_test_processed1_refine.txt"
+    )  # rgb.png
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, variant, inferred_ingredients_mode, inferred_ingredients_dim = build_model_for_checkpoint(args, device)
     model.eval()
 
-    # For fusion checkpoints, auto-align dataset ingredients format/dim to checkpoint.
     dataset_ingredients_mode = inferred_ingredients_mode if variant == "fusion" else args.ingredients_mode
     dataset_ingredients_dim = (inferred_ingredients_dim if inferred_ingredients_dim is not None else (255 if dataset_ingredients_mode == "binary255" else 512))
 
@@ -264,22 +272,40 @@ def main():
     pred_mean = {d: (pred_sum[d] / max(1, pred_cnt[d])) for d in dishes}
     gt_mean = {d: (gt_sum[d] / max(1, gt_cnt[d])) for d in dishes}
 
-    # PMAE definition (the one you validated earlier): sum(|pred-gt|)/sum(gt) * 100, dish-level.
-    pmae = {}
-    for j, name in enumerate(METRICS):
-        se = 0.0
-        sg = 0.0
-        for d in dishes:
+    # Match the provided script:
+    #   MAE = mean(|pred-gt|)
+    #   MAE_% = 100 * mean(|pred-gt|) / mean(gt)
+    groundtruth_values = {name: [] for name in METRICS}
+    err_values = {name: [] for name in METRICS}
+
+    for d in dishes:
+        for j, name in enumerate(METRICS):
             p = float(pred_mean[d][j])
             g = float(gt_mean[d][j])
-            se += abs(p - g)
-            sg += g
-        pmae[name] = (se / max(sg, 1e-12)) * 100.0
+            groundtruth_values[name].append(g)
+            err_values[name].append(abs(p - g))
 
-    avg_pmae = sum(pmae.values()) / len(METRICS)
+    output_stats = {}
+    mae_pct_values = []
+    for name in METRICS:
+        mae = statistics.mean(err_values[name]) if err_values[name] else 0.0
+        gt_avg = statistics.mean(groundtruth_values[name]) if groundtruth_values[name] else 0.0
+        mae_pct = 0.0 if abs(gt_avg) < 1e-12 else (100.0 * mae / gt_avg)
+        output_stats[f"{name}_MAE"] = mae
+        output_stats[f"{name}_MAE_%"] = mae_pct
+        mae_pct_values.append(mae_pct)
+
+    avg_mae_pct = statistics.mean(mae_pct_values) if mae_pct_values else 0.0
+
     print("Checkpoint:", args.checkpoint)
-    print("PMAE sum(|e|)/sum(gt) (%):", pmae)
-    print("AVG_PMAE (%):", avg_pmae)
+    print("MAE:", {k: output_stats[f"{k}_MAE"] for k in METRICS})
+    print("MAE_%:", {k: output_stats[f"{k}_MAE_%"] for k in METRICS})
+    print("AVG_MAE_%:", avg_mae_pct)
+
+    if args.out_json:
+        with open(args.out_json, "w") as f_out:
+            f_out.write(json.dumps(output_stats))
+        print(f"Saved: {args.out_json}")
 
     if args.out_csv:
         headers = ["dish_id"] + METRICS

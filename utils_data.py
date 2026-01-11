@@ -28,8 +28,30 @@ def get_DataLoader(args):
     nutrition_test_txt = os.path.join(args.data_root, 'imagery','rgbd_test_processed1_refine.txt') # depth_color.png
     nutrition_train_rgbd_txt = os.path.join(args.data_root, 'imagery','rgb_in_overhead_train_processed_refine.txt')
     nutrition_test_rgbd_txt = os.path.join(args.data_root, 'imagery','rgb_in_overhead_test_processed1_refine.txt') # rbg.png
-    trainset = Nutrition_RGBD(nutrition_rgbd_ims_root, nutrition_train_rgbd_txt, nutrition_train_txt, training = True, transform = train_transform)
-    testset = Nutrition_RGBD(nutrition_rgbd_ims_root, nutrition_test_rgbd_txt, nutrition_test_txt, training = False, transform = test_transform)
+    ingredients_mode = getattr(args, "ingredients_mode", "clip512")
+    ingredients_dim = 255 if ingredients_mode == "binary255" else 512
+    ingredients_vocab_path = getattr(args, "ingredients_vocab", "")
+
+    trainset = Nutrition_RGBD(
+        nutrition_rgbd_ims_root,
+        nutrition_train_rgbd_txt,
+        nutrition_train_txt,
+        training=True,
+        transform=train_transform,
+        ingredients_mode=ingredients_mode,
+        ingredients_dim=ingredients_dim,
+        ingredients_vocab_path=ingredients_vocab_path,
+    )
+    testset = Nutrition_RGBD(
+        nutrition_rgbd_ims_root,
+        nutrition_test_rgbd_txt,
+        nutrition_test_txt,
+        training=False,
+        transform=test_transform,
+        ingredients_mode=ingredients_mode,
+        ingredients_dim=ingredients_dim,
+        ingredients_vocab_path=ingredients_vocab_path,
+    )
 
     train_loader = DataLoader(trainset,
                               batch_size=args.b,
