@@ -1,0 +1,8 @@
+logs/
+saved/
+ingredients_fea_nonorm/
+__pycache__/
+*.pth
+*.pt
+*.ckpt
+*.pkl
