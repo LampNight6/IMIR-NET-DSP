@@ -3,6 +3,7 @@ import torch.nn as nn
 import clip
 from torchvision.models.resnet import Bottleneck, BasicBlock, conv1x1, conv3x3
 import torch.nn.functional as F
+from pytorch_wavelets import DWTForward, DWTInverse
 
 
 class CLIPVisionBranch(nn.Module):
@@ -138,6 +139,56 @@ class CA_SA_Enhance(nn.Module):
         sa = self.self_SA_Enhance(x_d)
         depth_enhance = depth.mul(sa)
         return depth_enhance
+
+
+class MBFM(nn.Module):
+    """
+    Multifrequency Bimodality Fusion Module (MBFM).
+
+    Uses DWT to split features into low/high frequency; discards depth high-frequency
+    components to suppress depth noise while keeping RGB texture details.
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        if in_channels % 2 != 0:
+            raise ValueError(f"MBFM expects even in_channels, got {in_channels}.")
+
+        hidden_channels = in_channels // 2
+
+        def cbr(in_ch: int, out_ch: int, k: int, padding: int):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=padding, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            )
+
+        self.rgb_reduce = cbr(in_channels, hidden_channels, k=1, padding=0)
+        self.depth_reduce = cbr(in_channels, hidden_channels, k=1, padding=0)
+
+        self.dwt = DWTForward(J=1, mode="zero", wave="haar")
+        self.idwt = DWTInverse(mode="zero", wave="haar")
+
+        self.rgb_ll_conv = cbr(hidden_channels, hidden_channels, k=3, padding=1)
+        self.depth_ll_conv = cbr(hidden_channels, hidden_channels, k=3, padding=1)
+
+        self.fuse_out = cbr(in_channels, in_channels, k=3, padding=1)
+
+    def forward(self, x_rgb: torch.Tensor, x_depth: torch.Tensor) -> torch.Tensor:
+        rgb_r = self.rgb_reduce(x_rgb)
+        depth_r = self.depth_reduce(x_depth)
+
+        rgb_ll, rgb_high = self.dwt(rgb_r)  # rgb_high: list length J
+        depth_ll, _depth_high = self.dwt(depth_r)
+
+        fused_ll = self.rgb_ll_conv(rgb_ll) + self.depth_ll_conv(depth_ll)
+
+        out_dwt = self.idwt((fused_ll, rgb_high))
+        if out_dwt.shape[-2:] != depth_r.shape[-2:]:
+            out_dwt = F.interpolate(out_dwt, size=depth_r.shape[-2:], mode="bilinear", align_corners=False)
+
+        fused = torch.cat([out_dwt, depth_r], dim=1)
+        return self.fuse_out(fused)
 
 class DilatedEncoder(nn.Module):
     """
@@ -419,8 +470,8 @@ class MyResNetRGBD(nn.Module):
         self.encoder_l3_depth = DilatedEncoder(in_channels=1024)
         self.encoder_l4_depth = DilatedEncoder(in_channels=2048)
 
-        self.CA_SA_Enhance_3 = CA_SA_Enhance(2048)
-        self.CA_SA_Enhance_4 = CA_SA_Enhance(4096)
+        self.mbfm_l3 = MBFM(in_channels=1024)
+        self.mbfm_l4 = MBFM(in_channels=2048)
 
         self.con2d = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, padding=1, bias=True)
         self.relu = nn.ReLU(inplace=True)
@@ -507,15 +558,13 @@ class MyResNetRGBD(nn.Module):
         x_fea_depth = self.model_depth.layer2(x_fea_depth)
         l3_fea_depth = self.model_depth.layer3(x_fea_depth)
 
-        # rgb refine depth
-        l3_fea_depth_rgb = self.CA_SA_Enhance_3(l3_fea_depth, l3_fea_rgb)
-        l3_fea_depth = l3_fea_depth + l3_fea_depth_rgb
+        # Layer 3 Fusion (RGB <- RGBD)
+        l3_fea_rgb = self.mbfm_l3(l3_fea_rgb, l3_fea_depth)
 
         l4_fea_depth = self.model_depth.layer4(l3_fea_depth)
 
-        #depth refine rgb
-        l4_fea_rgb_depth = self.CA_SA_Enhance_4(l4_fea_rgb, l4_fea_depth)
-        l4_fea_rgb = l4_fea_rgb + l4_fea_rgb_depth
+        # Layer 4 Fusion (RGB <- RGBD)
+        l4_fea_rgb = self.mbfm_l4(l4_fea_rgb, l4_fea_depth)
 
 
         l3_fea_rgb_dilate = self.encoder_l3_rgb(l3_fea_rgb)
