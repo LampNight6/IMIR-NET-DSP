@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import clip
+import timm
+from typing import Tuple
 from torchvision.models.resnet import Bottleneck, BasicBlock, conv1x1, conv3x3
 import torch.nn.functional as F
 from pytorch_wavelets import DWTForward, DWTInverse
@@ -87,6 +89,69 @@ class CLIPVisionBranch(nn.Module):
         if clip_s3 is None or clip_s4 is None:
             raise RuntimeError("CLIPVisionBranch hooks did not capture layer3/layer4 features.")
         return clip_s3.float(), clip_s4.float()
+
+
+class RGB_Backbone_Swin(nn.Module):
+    """
+    RGB branch backbone: Swin Transformer Base (384x384).
+
+    Returns stage3/stage4 features with channels (512, 1024).
+    """
+
+    def __init__(self, pretrained: bool = True, img_size: int = 384, in_chans: int = 3):
+        super().__init__()
+        self.img_size = int(img_size)
+        self.backbone = timm.create_model(
+            "swin_base_patch4_window12_384",
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(2, 3),
+            img_size=img_size,
+            in_chans=in_chans,
+        )
+        channels = list(self.backbone.feature_info.channels())
+        if channels != [512, 1024]:
+            raise RuntimeError(
+                f"Unexpected Swin stage channels {channels}; expected [512, 1024] for stage3/stage4."
+            )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if x.shape[-2:] != (self.img_size, self.img_size):
+            x = F.interpolate(x, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
+        s3, s4 = self.backbone(x)
+        # timm Swin features are often returned as NHWC; normalize to NCHW.
+        if s3.dim() == 4 and s3.shape[1] != 512 and s3.shape[-1] == 512:
+            s3 = s3.permute(0, 3, 1, 2).contiguous()
+        if s4.dim() == 4 and s4.shape[1] != 1024 and s4.shape[-1] == 1024:
+            s4 = s4.permute(0, 3, 1, 2).contiguous()
+        return s3, s4
+
+
+class Depth_Backbone_ConvNeXt(nn.Module):
+    """
+    Depth branch backbone: ConvNeXt-Tiny.
+
+    Returns stage3/stage4 features with channels (384, 768).
+    """
+
+    def __init__(self, pretrained: bool = True, in_chans: int = 3):
+        super().__init__()
+        self.backbone = timm.create_model(
+            "convnext_tiny",
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(2, 3),
+            in_chans=in_chans,
+        )
+        channels = list(self.backbone.feature_info.channels())
+        if channels != [384, 768]:
+            raise RuntimeError(
+                f"Unexpected ConvNeXt stage channels {channels}; expected [384, 768] for stage3/stage4."
+            )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        s3, s4 = self.backbone(x)
+        return s3, s4
 
 class CA_Enhance(nn.Module):
     def __init__(self, in_planes, ratio=16):
@@ -433,21 +498,29 @@ class MyResNet(nn.Module):
 class MyResNetRGBD(nn.Module):
     def __init__(self, ingredients_dim: int = 255):
         super(MyResNetRGBD, self).__init__()
-        self.model_rgb = MyResNet(Bottleneck, [3, 4, 23, 3])  # 这里具体的参数参考库中源代码
-        self.model_rgb.load_state_dict(torch.load('food2k_resnet101_0.0001.pth'), strict=False)
+        self.rgb_encoder = RGB_Backbone_Swin(pretrained=True)
+        self.depth_encoder = Depth_Backbone_ConvNeXt(pretrained=True)
 
-        self.model_depth = MyResNet(Bottleneck, [3, 4, 23, 3])  # 这里具体的参数参考库中源代码
-        self.model_depth.load_state_dict(torch.load('food2k_resnet101_0.0001.pth'), strict=False)
-
-        self.clip_branch = CLIPVisionBranch()
-        self.clip_fusion_s3 = nn.Sequential(
-            nn.Conv2d(in_channels=2048, out_channels=1024, kernel_size=1, bias=False),
+        self.depth_proj_l3 = nn.Sequential(
+            nn.Conv2d(in_channels=384, out_channels=512, kernel_size=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+        self.depth_proj_l4 = nn.Sequential(
+            nn.Conv2d(in_channels=768, out_channels=1024, kernel_size=1, bias=False),
             nn.BatchNorm2d(1024),
             nn.ReLU(inplace=True),
         )
+
+        self.clip_branch = CLIPVisionBranch()
+        self.clip_fusion_s3 = nn.Sequential(
+            nn.Conv2d(in_channels=1536, out_channels=512, kernel_size=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
         self.clip_fusion_s4 = nn.Sequential(
-            nn.Conv2d(in_channels=4096, out_channels=2048, kernel_size=1, bias=False),
-            nn.BatchNorm2d(2048),
+            nn.Conv2d(in_channels=3072, out_channels=1024, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1024),
             nn.ReLU(inplace=True),
         )
         self.enable_clip_fusion = True
@@ -464,58 +537,22 @@ class MyResNetRGBD(nn.Module):
         self.carb = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
         self.protein = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
 
-        self.encoder_l3_rgb = DilatedEncoder(in_channels=1024)
-        self.encoder_l4_rgb = DilatedEncoder(in_channels=2048)
+        self.encoder_l3_rgb = DilatedEncoder(in_channels=512, encoder_channels=512, block_mid_channels=128)
+        self.encoder_l4_rgb = DilatedEncoder(in_channels=1024, encoder_channels=1024, block_mid_channels=256)
 
-        self.encoder_l3_depth = DilatedEncoder(in_channels=1024)
-        self.encoder_l4_depth = DilatedEncoder(in_channels=2048)
+        self.mbfm_l3 = MBFM(in_channels=512)
+        self.mbfm_l4 = MBFM(in_channels=1024)
 
-        self.mbfm_l3 = MBFM(in_channels=1024)
-        self.mbfm_l4 = MBFM(in_channels=2048)
-
-        self.con2d = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, padding=1, bias=True)
+        self.con2d = nn.Conv2d(in_channels=1536, out_channels=512, kernel_size=3, padding=1, bias=True)
         self.relu = nn.ReLU(inplace=True)
 
-        self.con2d_t = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, padding=1, bias=True)
+        self.con2d_t = nn.Conv2d(in_channels=1536, out_channels=512, kernel_size=3, padding=1, bias=True)
         self.fc_t = nn.Linear(512,512)
 
     def load_state_dict(self, state_dict, strict: bool = True):
-        if not strict:
-            incompatible = super().load_state_dict(state_dict, strict=False)
-            if not any(k.startswith("clip_fusion_s3.") or k.startswith("clip_fusion_s4.") for k in state_dict.keys()):
-                self.enable_clip_fusion = False
-            return incompatible
-
         incompatible = super().load_state_dict(state_dict, strict=False)
         if not any(k.startswith("clip_fusion_s3.") or k.startswith("clip_fusion_s4.") for k in state_dict.keys()):
             self.enable_clip_fusion = False
-
-        allowed_missing_prefixes = (
-            "clip_branch.",
-            "clip_fusion_s3.",
-            "clip_fusion_s4.",
-        )
-
-        missing_keys = [
-            k for k in incompatible.missing_keys
-            if not any(k.startswith(p) for p in allowed_missing_prefixes)
-        ]
-        unexpected_keys = incompatible.unexpected_keys
-
-        if missing_keys or unexpected_keys:
-            error_msgs = []
-            if missing_keys:
-                error_msgs.append('Missing key(s) in state_dict: {}.'.format(
-                    ', '.join('"{}"'.format(k) for k in missing_keys)
-                ))
-            if unexpected_keys:
-                error_msgs.append('Unexpected key(s) in state_dict: {}.'.format(
-                    ', '.join('"{}"'.format(k) for k in unexpected_keys)
-                ))
-            raise RuntimeError("Error(s) in loading state_dict for {}:\n\t{}".format(
-                self.__class__.__name__, "\n\t".join(error_msgs)
-            ))
-
         return incompatible
 
     def state_dict(self, *args, **kwargs):
@@ -526,15 +563,7 @@ class MyResNetRGBD(nn.Module):
         return state
 
     def forward(self, x_rgb, x_depth, ingredients_vec):
-        x_fea = self.model_rgb.conv1(x_rgb)
-        x_fea = self.model_rgb.bn1(x_fea)
-        x_fea = self.model_rgb.relu(x_fea)
-        x_fea = self.model_rgb.maxpool(x_fea)
-
-        x_fea = self.model_rgb.layer1(x_fea)
-        x_fea = self.model_rgb.layer2(x_fea)
-        rgb_s3 = self.model_rgb.layer3(x_fea)
-        rgb_s4 = self.model_rgb.layer4(rgb_s3)
+        rgb_s3, rgb_s4 = self.rgb_encoder(x_rgb)
 
         if self.enable_clip_fusion:
             clip_s3, clip_s4 = self.clip_branch(x_rgb)
@@ -549,19 +578,17 @@ class MyResNetRGBD(nn.Module):
             l4_fea_rgb = rgb_s4
 
         ######################################
-        x_fea_depth = self.model_depth.conv1(x_depth)
-        x_fea_depth = self.model_depth.bn1(x_fea_depth)
-        x_fea_depth = self.model_depth.relu(x_fea_depth)
-        x_fea_depth = self.model_depth.maxpool(x_fea_depth)
+        l3_fea_depth, l4_fea_depth = self.depth_encoder(x_depth)
+        if l3_fea_depth.shape[-2:] != l3_fea_rgb.shape[-2:]:
+            l3_fea_depth = F.interpolate(l3_fea_depth, size=l3_fea_rgb.shape[-2:], mode="bilinear", align_corners=False)
+        if l4_fea_depth.shape[-2:] != l4_fea_rgb.shape[-2:]:
+            l4_fea_depth = F.interpolate(l4_fea_depth, size=l4_fea_rgb.shape[-2:], mode="bilinear", align_corners=False)
 
-        x_fea_depth = self.model_depth.layer1(x_fea_depth)
-        x_fea_depth = self.model_depth.layer2(x_fea_depth)
-        l3_fea_depth = self.model_depth.layer3(x_fea_depth)
+        l3_fea_depth = self.depth_proj_l3(l3_fea_depth)
+        l4_fea_depth = self.depth_proj_l4(l4_fea_depth)
 
         # Layer 3 Fusion (RGB <- RGBD)
         l3_fea_rgb = self.mbfm_l3(l3_fea_rgb, l3_fea_depth)
-
-        l4_fea_depth = self.model_depth.layer4(l3_fea_depth)
 
         # Layer 4 Fusion (RGB <- RGBD)
         l4_fea_rgb = self.mbfm_l4(l4_fea_rgb, l4_fea_depth)
@@ -572,7 +599,9 @@ class MyResNetRGBD(nn.Module):
 
         # l3_fea_rgb_pool = self.avgpool(l3_fea_rgb_dilate)
         # l4_fea_rgb_pool = self.avgpool(l4_fea_rgb_dilate)
-        l4_fea_rgb_dilate_up = torch.nn.functional.interpolate(l4_fea_rgb_dilate, scale_factor=2, mode='bilinear', align_corners=False)
+        l4_fea_rgb_dilate_up = torch.nn.functional.interpolate(
+            l4_fea_rgb_dilate, size=l3_fea_rgb_dilate.shape[-2:], mode='bilinear', align_corners=False
+        )
         #rgb_fea = l3_fea_rgb_pool + l4_fea_rgb_pool_up
         rgb_fea_cat = torch.cat((l3_fea_rgb_dilate, l4_fea_rgb_dilate_up), dim=1)
         #print(rgb_fea.shape)
