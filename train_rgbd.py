@@ -31,7 +31,7 @@ parser.add_argument('--epochs', default=300, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('--b', '--batch-size', default=4, type=int,
+parser.add_argument('--b', '--batch-size', default=20, type=int,
                     metavar='N', help='mini-batch size (default: 128)')
 parser.add_argument('--lr', '--learning-rate', default=0.0001, type=float,
                     metavar='LR', help='initial learning rate')
@@ -73,12 +73,12 @@ parser.add_argument(
 )
 # parser.add_argument('--accum_steps', type=int, default=5,
 #                     help="Gradient accumulation steps. Effective batch size = batch_size * accum_steps.")
-parser.add_argument(
-    "--accum_steps",
-    type=int,
-    default=5,
-    help="Gradient accumulation steps. Effective batch size = batch_size * accum_steps.",
-)
+# parser.add_argument(
+#     "--accum_steps",
+#     type=int,
+#     default=5,
+#     help="Gradient accumulation steps. Effective batch size = batch_size * accum_steps.",
+# )
 
 args = parser.parse_args()
 
@@ -200,7 +200,7 @@ def train(train_loader, model, criterion, optimizer, device, epoch):
                           desc="Training (X / X Steps) (loss=X.X)",
                           bar_format="{l_bar}{r_bar}",
                           dynamic_ncols=True)
-    accum_steps = max(int(getattr(args, "accum_steps", 1)), 1)
+    # accum_steps = max(int(getattr(args, "accum_steps", 1)), 1)
     optimizer.zero_grad(set_to_none=True)
     for batch_idx, x in enumerate(epoch_iterator):  # (inputs, targets,ingredient)
         '''Portion Independent Model'''
@@ -221,11 +221,14 @@ def train(train_loader, model, criterion, optimizer, device, epoch):
         total_protein_loss = total_calories.shape[0] * criterion(outputs[4], total_protein) / total_protein.sum().item()
         loss = total_calories_loss + total_mass_loss + total_fat_loss + total_carb_loss + total_protein_loss
 
-        (loss / accum_steps).backward()
-        do_step = ((batch_idx + 1) % accum_steps == 0) or (batch_idx + 1 == len(train_loader))
-        if do_step:
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+        # (loss / accum_steps).backward()
+        # do_step = ((batch_idx + 1) % accum_steps == 0) or (batch_idx + 1 == len(train_loader))
+        # if do_step:
+        #     optimizer.step()
+        #     optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
         train_loss += loss.item()
         calories_loss += total_calories_loss.item()

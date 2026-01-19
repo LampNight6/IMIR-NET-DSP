@@ -53,18 +53,12 @@ def load_checkpoint(model, checkpoint_path, device):
     if isinstance(ckpt, (dict, OrderedDict)):
         state_dict = _strip_module_prefix(ckpt)
 
-        # If this is a plain ResNet state_dict (e.g., Food2K) without model_rgb/model_depth prefixes,
-        # load it into both backbones (this is what MyResNetRGBD expects as pretrain).
-        if (
-            hasattr(model, "model_rgb")
-            and hasattr(model, "model_depth")
-            and any(isinstance(k, str) and not k.startswith(("model_rgb.", "model_depth.")) for k in state_dict.keys())
-        ):
-            model.model_rgb.load_state_dict(state_dict, strict=False)
-            model.model_depth.load_state_dict(state_dict, strict=False)
-            print(f"[INFO] Loaded backbone weights into model_rgb/model_depth from: {checkpoint_path}")
-            print("[WARN] This checkpoint does not include the IMIR-Net regression head; use ./saved/ckpt_best.pth for meaningful nutrition predictions.")
-            return
+        # If this looks like a bare backbone checkpoint (not a full IMIR-Net checkpoint),
+        # we can only attempt to load what matches and ignore the rest.
+        if any(isinstance(k, str) and not k.startswith(("clip_", "mbfm_", "encoder_", "con2d", "ingredients_", "fusion_", "calorie", "mass", "fat", "carb", "protein")) for k in state_dict.keys()):
+            print(
+                "[WARN] Checkpoint may not be a full IMIR-Net checkpoint; loading with strict=False and ignoring mismatched keys."
+            )
 
         # Fallback: try to load into the full model.
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
