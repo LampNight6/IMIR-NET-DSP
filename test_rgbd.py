@@ -3,6 +3,8 @@ from __future__ import print_function
 import argparse
 import os
 import csv
+import subprocess
+import types
 from collections import OrderedDict
 
 import numpy as np
@@ -16,6 +18,8 @@ from mynetwork import MyResNetRGBD, MyResNetRGBDLegacy
 
 
 METRICS = ["calories", "mass", "fat", "carb", "protein"]
+HIST_CASA_ING_COMMIT = "8ed3b23"
+_HIST_MODULE_CACHE = {}
 
 
 def to_scalar(x):
@@ -89,19 +93,65 @@ def _infer_ingredients_dim_from_state_dict(state_dict):
     return None
 
 
+def _has_prefix(state_dict, prefixes):
+    return any(isinstance(k, str) and k.startswith(prefixes) for k in state_dict.keys())
+
+
+def _load_historical_mynetwork_module(commit):
+    if commit in _HIST_MODULE_CACHE:
+        return _HIST_MODULE_CACHE[commit]
+    try:
+        raw = subprocess.check_output(["git", "show", f"{commit}:mynetwork.py"])
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load historical mynetwork.py at commit {commit}. "
+            "Please ensure this repo has git history available."
+        ) from exc
+    source = raw.decode("utf-8", "ignore")
+    module = types.ModuleType(f"hist_mynetwork_{commit}")
+    module.__file__ = f"<git:{commit}:mynetwork.py>"
+    exec(compile(source, module.__file__, "exec"), module.__dict__)
+    _HIST_MODULE_CACHE[commit] = module
+    return module
+
+
+def _build_historical_casa_ingredients_model(ingredients_dim, device):
+    hist_module = _load_historical_mynetwork_module(HIST_CASA_ING_COMMIT)
+    model_cls = getattr(hist_module, "MyResNetRGBD", None)
+    if model_cls is None:
+        raise RuntimeError(
+            f"Historical mynetwork.py at {HIST_CASA_ING_COMMIT} does not define MyResNetRGBD."
+        )
+    return model_cls(ingredients_dim=ingredients_dim).to(device)
+
+
 def build_model_for_checkpoint(args, device):
     ckpt = torch.load(args.checkpoint, map_location=device)
     state_dict = _extract_state_dict(ckpt)
+    has_ing_fusion_head = _has_prefix(state_dict, ("ingredients_fc1.", "fusion_fc."))
+    has_casa = _has_prefix(state_dict, ("CA_SA_Enhance_3.", "CA_SA_Enhance_4."))
+    has_mbfm = _has_prefix(state_dict, ("mbfm_l3.", "mbfm_l4."))
 
     if args.model_variant == "legacy":
         variant = "legacy"
     elif args.model_variant == "fusion":
         variant = "fusion"
+    elif args.model_variant == "ca_sa_ingredients":
+        variant = "ca_sa_ingredients"
     else:
-        variant = "fusion" if any(k.startswith(("ingredients_fc1.", "fusion_fc.")) for k in state_dict.keys()) else "legacy"
+        if has_ing_fusion_head and has_casa and not has_mbfm:
+            variant = "ca_sa_ingredients"
+        elif has_ing_fusion_head:
+            variant = "fusion"
+        else:
+            variant = "legacy"
 
     if variant == "legacy":
         model = MyResNetRGBDLegacy().to(device)
+    elif variant == "ca_sa_ingredients":
+        inferred_dim = _infer_ingredients_dim_from_state_dict(state_dict)
+        ingredients_dim = inferred_dim if inferred_dim is not None else (255 if args.ingredients_mode == "binary255" else 512)
+        model = _build_historical_casa_ingredients_model(ingredients_dim=ingredients_dim, device=device)
     else:
         inferred_dim = _infer_ingredients_dim_from_state_dict(state_dict)
         ingredients_dim = inferred_dim if inferred_dim is not None else (255 if args.ingredients_mode == "binary255" else 512)
@@ -150,8 +200,8 @@ def main():
         "--model_variant",
         type=str,
         default="auto",
-        choices=["auto", "legacy", "fusion"],
-        help="Which model definition to use for the checkpoint: legacy (old checkpoints) or fusion (ingredients-gated).",
+        choices=["auto", "legacy", "fusion", "ca_sa_ingredients"],
+        help="Model definition to use: legacy, fusion (MBFM), or ca_sa_ingredients (historical CA_SA + ingredients).",
     )
     parser.add_argument(
         "--ingredients_vocab",
@@ -173,10 +223,11 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, variant, inferred_ingredients_mode, inferred_ingredients_dim = build_model_for_checkpoint(args, device)
+    print(f"[INFO] Selected model_variant: {variant}")
     model.eval()
 
     # For fusion checkpoints, auto-align dataset ingredients format/dim to checkpoint.
-    dataset_ingredients_mode = inferred_ingredients_mode if variant == "fusion" else args.ingredients_mode
+    dataset_ingredients_mode = inferred_ingredients_mode if variant in ("fusion", "ca_sa_ingredients") else args.ingredients_mode
     dataset_ingredients_dim = (inferred_ingredients_dim if inferred_ingredients_dim is not None else (255 if dataset_ingredients_mode == "binary255" else 512))
 
     testset = Nutrition_RGBD(
