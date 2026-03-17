@@ -1,0 +1,13 @@
+{
+  "dish_id": "dish_1566838286",
+  "ingredients": [
+    "pineapple"
+  ],
+  "ground_truth": {
+    "calories": 72.5,
+    "mass": 145.0,
+    "fat": 0.145,
+    "carb": 18.849998,
+    "protein": 0.725
+  }
+}

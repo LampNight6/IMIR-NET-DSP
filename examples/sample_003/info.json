@@ -1,0 +1,28 @@
+{
+  "dish_id": "dish_1564687013",
+  "ingredients": [
+    "bell peppers",
+    "cilantro",
+    "fish",
+    "jalapenos",
+    "kale",
+    "ketchup",
+    "lime",
+    "millet",
+    "olive oil",
+    "onions",
+    "salt",
+    "shallots",
+    "spinach (raw)",
+    "steak",
+    "vinegar",
+    "white rice"
+  ],
+  "ground_truth": {
+    "calories": 330.840851,
+    "mass": 224.0,
+    "fat": 26.888262,
+    "carb": 14.725341,
+    "protein": 32.21138
+  }
+}

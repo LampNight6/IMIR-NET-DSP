@@ -1,0 +1,43 @@
+{
+  "dish_id": "dish_1563565508",
+  "ingredients": [
+    "arugula",
+    "blueberries",
+    "bok choy",
+    "caesar dressing",
+    "carrot",
+    "celery",
+    "chard",
+    "cherry tomatoes",
+    "chive",
+    "corn on the cob",
+    "cream",
+    "croutons",
+    "eggs",
+    "fish",
+    "garlic",
+    "ground turkey",
+    "kale",
+    "lemon juice",
+    "mushroom",
+    "mustard",
+    "olive oil",
+    "onions",
+    "parmesan cheese",
+    "parsley",
+    "pecans",
+    "salt",
+    "shallots",
+    "thyme",
+    "vinegar",
+    "wheat berry",
+    "white rice"
+  ],
+  "ground_truth": {
+    "calories": 403.862,
+    "mass": 387.0,
+    "fat": 24.761736,
+    "carb": 32.026699,
+    "protein": 26.264353
+  }
+}

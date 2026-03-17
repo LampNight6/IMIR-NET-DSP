@@ -1,0 +1,35 @@
+{
+  "dish_id": "dish_1561148021",
+  "ingredients": [
+    "almonds",
+    "arugula",
+    "blueberries",
+    "carrot",
+    "celery",
+    "chard",
+    "cheese pizza",
+    "chive",
+    "cream",
+    "eggs",
+    "garlic",
+    "ground turkey",
+    "kale",
+    "mushroom",
+    "mustard",
+    "olive oil",
+    "onions",
+    "raspberries",
+    "salt",
+    "thyme",
+    "vinegar",
+    "white rice",
+    "zucchini"
+  ],
+  "ground_truth": {
+    "calories": 361.765411,
+    "mass": 216.0,
+    "fat": 19.948797,
+    "carb": 23.611561,
+    "protein": 22.204132
+  }
+}
