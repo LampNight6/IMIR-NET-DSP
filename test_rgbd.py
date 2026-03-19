@@ -1,25 +1,20 @@
-from __future__ import print_function
+﻿from __future__ import print_function
 
 import argparse
-import os
 import csv
-import subprocess
-import types
+import os
 from collections import OrderedDict
 
 import numpy as np
 import torch
-from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from tqdm import tqdm
 
 from mydataset import Nutrition_RGBD
-from mynetwork import MyResNetRGBD, MyResNetRGBDLegacy
-
+from mynetwork import MyResNetRGBD
 
 METRICS = ["calories", "mass", "fat", "carb", "protein"]
-HIST_CASA_ING_COMMIT = "8ed3b23"
-_HIST_MODULE_CACHE = {}
 
 
 def to_scalar(x):
@@ -42,174 +37,41 @@ def _strip_module_prefix(state_dict):
 def load_checkpoint(model, checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location=device)
 
-    # Common training checkpoint format: {"epoch": ..., "state_dict": ...}
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        state_dict = _strip_module_prefix(ckpt["state_dict"])
-        try:
-            model.load_state_dict(state_dict, strict=True)
-        except RuntimeError as e:
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            print(f"[WARN] load_state_dict(strict=True) failed: {e}")
-            print(f"[WARN] Retried with strict=False. missing={len(missing)} unexpected={len(unexpected)}")
-        return
-
-    # Some checkpoints are directly a state_dict (OrderedDict of parameter tensors).
-    if isinstance(ckpt, (dict, OrderedDict)):
-        state_dict = _strip_module_prefix(ckpt)
-
-        # If this is a plain ResNet state_dict (e.g., Food2K) without model_rgb/model_depth prefixes,
-        # load it into both backbones (this is what MyResNetRGBD expects as pretrain).
-        if (
-            hasattr(model, "model_rgb")
-            and hasattr(model, "model_depth")
-            and any(isinstance(k, str) and not k.startswith(("model_rgb.", "model_depth.")) for k in state_dict.keys())
-        ):
-            model.model_rgb.load_state_dict(state_dict, strict=False)
-            model.model_depth.load_state_dict(state_dict, strict=False)
-            print(f"[INFO] Loaded backbone weights into model_rgb/model_depth from: {checkpoint_path}")
-            print("[WARN] This checkpoint does not include the IMIR-Net regression head; use ./saved/ckpt_best.pth for meaningful nutrition predictions.")
-            return
-
-        # Fallback: try to load into the full model.
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        print(f"[INFO] Loaded checkpoint with strict=False from: {checkpoint_path} (missing={len(missing)} unexpected={len(unexpected)})")
-        return
-
-    raise ValueError(f"Unrecognized checkpoint format at: {checkpoint_path}")
-
-
-def _extract_state_dict(ckpt):
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        return _strip_module_prefix(ckpt["state_dict"])
-    if isinstance(ckpt, (dict, OrderedDict)):
-        return _strip_module_prefix(ckpt)
-    raise ValueError("Unrecognized checkpoint format (no state_dict).")
-
-
-def _infer_ingredients_dim_from_state_dict(state_dict):
-    w = state_dict.get("ingredients_fc1.weight")
-    if isinstance(w, torch.Tensor) and w.dim() == 2:
-        return int(w.shape[1])
-    return None
-
-
-def _has_prefix(state_dict, prefixes):
-    return any(isinstance(k, str) and k.startswith(prefixes) for k in state_dict.keys())
-
-
-def _load_historical_mynetwork_module(commit):
-    if commit in _HIST_MODULE_CACHE:
-        return _HIST_MODULE_CACHE[commit]
-    try:
-        raw = subprocess.check_output(["git", "show", f"{commit}:mynetwork.py"])
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to load historical mynetwork.py at commit {commit}. "
-            "Please ensure this repo has git history available."
-        ) from exc
-    source = raw.decode("utf-8", "ignore")
-    module = types.ModuleType(f"hist_mynetwork_{commit}")
-    module.__file__ = f"<git:{commit}:mynetwork.py>"
-    exec(compile(source, module.__file__, "exec"), module.__dict__)
-    _HIST_MODULE_CACHE[commit] = module
-    return module
-
-
-def _build_historical_casa_ingredients_model(ingredients_dim, device):
-    hist_module = _load_historical_mynetwork_module(HIST_CASA_ING_COMMIT)
-    model_cls = getattr(hist_module, "MyResNetRGBD", None)
-    if model_cls is None:
-        raise RuntimeError(
-            f"Historical mynetwork.py at {HIST_CASA_ING_COMMIT} does not define MyResNetRGBD."
-        )
-    return model_cls(ingredients_dim=ingredients_dim).to(device)
-
-
-def build_model_for_checkpoint(args, device):
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    state_dict = _extract_state_dict(ckpt)
-    has_ing_fusion_head = _has_prefix(state_dict, ("ingredients_fc1.", "fusion_fc."))
-    has_casa = _has_prefix(state_dict, ("CA_SA_Enhance_3.", "CA_SA_Enhance_4."))
-    has_mbfm = _has_prefix(state_dict, ("mbfm_l3.", "mbfm_l4."))
-
-    if args.model_variant == "legacy":
-        variant = "legacy"
-    elif args.model_variant == "fusion":
-        variant = "fusion"
-    elif args.model_variant == "ca_sa_ingredients":
-        variant = "ca_sa_ingredients"
-    else:
-        if has_ing_fusion_head and has_casa and not has_mbfm:
-            variant = "ca_sa_ingredients"
-        elif has_ing_fusion_head:
-            variant = "fusion"
-        else:
-            variant = "legacy"
-
-    if variant == "legacy":
-        model = MyResNetRGBDLegacy().to(device)
-    elif variant == "ca_sa_ingredients":
-        inferred_dim = _infer_ingredients_dim_from_state_dict(state_dict)
-        ingredients_dim = inferred_dim if inferred_dim is not None else (255 if args.ingredients_mode == "binary255" else 512)
-        model = _build_historical_casa_ingredients_model(ingredients_dim=ingredients_dim, device=device)
-    else:
-        inferred_dim = _infer_ingredients_dim_from_state_dict(state_dict)
-        ingredients_dim = inferred_dim if inferred_dim is not None else (255 if args.ingredients_mode == "binary255" else 512)
-        model = MyResNetRGBD(ingredients_dim=ingredients_dim).to(device)
-
-    # load weights
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         payload = _strip_module_prefix(ckpt["state_dict"])
+    elif isinstance(ckpt, (dict, OrderedDict)):
+        payload = _strip_module_prefix(ckpt)
     else:
-        payload = state_dict
+        raise RuntimeError("Unsupported checkpoint format")
 
     try:
         model.load_state_dict(payload, strict=True)
     except RuntimeError as e:
         print(f"[WARN] load_state_dict(strict=True) failed: {e}")
-        # Remove incompatible shapes (strict=False still errors on size mismatch).
         model_sd = model.state_dict()
-        filtered = {k: v for k, v in payload.items() if k in model_sd and getattr(v, "shape", None) == getattr(model_sd[k], "shape", None)}
+        filtered = {
+            k: v
+            for k, v in payload.items()
+            if k in model_sd and getattr(v, "shape", None) == getattr(model_sd[k], "shape", None)
+        }
         missing, unexpected = model.load_state_dict(filtered, strict=False)
         print(f"[WARN] Retried with filtered strict=False. missing={len(missing)} unexpected={len(unexpected)}")
-
-    inferred_dim = None if variant == "legacy" else _infer_ingredients_dim_from_state_dict(state_dict)
-    inferred_mode = "clip512"
-    if inferred_dim == 255:
-        inferred_mode = "binary255"
-    elif inferred_dim == 512:
-        inferred_mode = "clip512"
-    return model, variant, inferred_mode, inferred_dim
 
 
 def main():
     parser = argparse.ArgumentParser(description="IMIR-Net RGB-D inference")
     parser.add_argument("--data_root", type=str, required=True, help="Dataset root containing imagery/")
     parser.add_argument("--checkpoint", type=str, default="./saved/ckpt_best.pth", help="Path to checkpoint .pth")
-    parser.add_argument("--out_csv", type=str, default="", help="If set, write dish-level predictions CSV")
+    parser.add_argument("--out_csv", type=str, default="epoch_result_dish.csv", help="Write dish-level predictions CSV")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument(
-        "--ingredients_mode",
-        type=str,
-        default="clip512",
-        choices=["clip512", "binary255"],
-        help="Must match the checkpoint's ingredients head (clip512 or binary255).",
-    )
-    parser.add_argument(
-        "--model_variant",
-        type=str,
-        default="auto",
-        choices=["auto", "legacy", "fusion", "ca_sa_ingredients"],
-        help="Model definition to use: legacy, fusion (MBFM), or ca_sa_ingredients (historical CA_SA + ingredients).",
-    )
-    parser.add_argument(
-        "--ingredients_vocab",
-        type=str,
-        default="",
-        help="(binary255 only) JSON vocab: list[255] of names or {name: idx}.",
-    )
-    args = parser.parse_args()
+
+    # Compatibility args: accepted but not used in this repository version.
+    parser.add_argument("--model_variant", type=str, default="auto")
+    parser.add_argument("--ingredients_mode", type=str, default="clip512")
+    parser.add_argument("--ingredients_vocab", type=str, default="")
+
+    args, _ = parser.parse_known_args()
 
     test_transform = transforms.Compose([
         transforms.Resize((416, 416)),
@@ -218,17 +80,8 @@ def main():
     ])
 
     nutrition_rgbd_ims_root = os.path.join(args.data_root, "imagery")
-    nutrition_test_txt = os.path.join(args.data_root, "imagery", "rgbd_test_processed1_refine.txt")  # depth_color.png
-    nutrition_test_rgbd_txt = os.path.join(args.data_root, "imagery", "rgb_in_overhead_test_processed1_refine.txt")  # rgb.png
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, variant, inferred_ingredients_mode, inferred_ingredients_dim = build_model_for_checkpoint(args, device)
-    print(f"[INFO] Selected model_variant: {variant}")
-    model.eval()
-
-    # For fusion checkpoints, auto-align dataset ingredients format/dim to checkpoint.
-    dataset_ingredients_mode = inferred_ingredients_mode if variant in ("fusion", "ca_sa_ingredients") else args.ingredients_mode
-    dataset_ingredients_dim = (inferred_ingredients_dim if inferred_ingredients_dim is not None else (255 if dataset_ingredients_mode == "binary255" else 512))
+    nutrition_test_txt = os.path.join(args.data_root, "imagery", "rgbd_test_processed1_refine.txt")
+    nutrition_test_rgbd_txt = os.path.join(args.data_root, "imagery", "rgb_in_overhead_test_processed1_refine.txt")
 
     testset = Nutrition_RGBD(
         nutrition_rgbd_ims_root,
@@ -236,9 +89,6 @@ def main():
         nutrition_test_txt,
         training=False,
         transform=test_transform,
-        ingredients_mode=dataset_ingredients_mode,
-        ingredients_dim=dataset_ingredients_dim,
-        ingredients_vocab_path=args.ingredients_vocab,
     )
 
     testloader = DataLoader(
@@ -248,6 +98,11 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
     )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MyResNetRGBD().to(device)
+    load_checkpoint(model, args.checkpoint, device)
+    model.eval()
 
     epoch_iterator = tqdm(
         testloader,
@@ -270,13 +125,9 @@ def main():
             total_carb = x[5].to(device).float().view(-1)
             total_protein = x[6].to(device).float().view(-1)
             inputs_rgbd = x[7].to(device)
-            inputs_ingredients = x[8].to(device)
 
-            if variant == "legacy":
-                out = model(inputs, inputs_rgbd)
-                outputs = out[0] if isinstance(out, (tuple, list)) and len(out) == 2 else out
-            else:
-                outputs = model(inputs, inputs_rgbd, inputs_ingredients)
+            out = model(inputs, inputs_rgbd)
+            outputs = out[0] if isinstance(out, (tuple, list)) and len(out) == 2 else out
 
             preds = []
             for k in range(5):
@@ -315,7 +166,6 @@ def main():
     pred_mean = {d: (pred_sum[d] / max(1, pred_cnt[d])) for d in dishes}
     gt_mean = {d: (gt_sum[d] / max(1, gt_cnt[d])) for d in dishes}
 
-    # PMAE definition (the one you validated earlier): sum(|pred-gt|)/sum(gt) * 100, dish-level.
     pmae = {}
     for j, name in enumerate(METRICS):
         se = 0.0
@@ -328,6 +178,7 @@ def main():
         pmae[name] = (se / max(sg, 1e-12)) * 100.0
 
     avg_pmae = sum(pmae.values()) / len(METRICS)
+
     print("Checkpoint:", args.checkpoint)
     print("PMAE sum(|e|)/sum(gt) (%):", pmae)
     print("AVG_PMAE (%):", avg_pmae)

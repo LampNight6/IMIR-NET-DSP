@@ -3,7 +3,6 @@ import argparse
 import os
 import shutil
 import time
-from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -54,76 +53,49 @@ parser.add_argument('--val_list', default='', type=str, metavar='PATH',
                     help='path to validation list (default: none)')
 parser.add_argument('--save_path', default='', type=str, metavar='PATH',
                     help='path to save checkpoint (default: none)')
-parser.add_argument('--run_name', type=str, default="",
-                    help="Experiment name; if empty, uses a timestamp (prevents overwriting).")
-parser.add_argument('--exp_root', type=str, default="",
-                    help="Optional root dir for logs/saved (default: current project dirs).")
-parser.add_argument(
-    "--ingredients_mode",
-    type=str,
-    default="clip512",
-    choices=["clip512", "binary255"],
-    help="Ingredients supervision format: clip512 (regress CLIP text features) or binary255 (0/1 vector).",
-)
-parser.add_argument(
-    "--ingredients_vocab",
-    type=str,
-    default="",
-    help="(binary255 only) JSON vocab: list[255] of names or {name: idx}. Required if ingredient items are strings.",
-)
-# parser.add_argument('--accum_steps', type=int, default=5,
-#                     help="Gradient accumulation steps. Effective batch size = batch_size * accum_steps.")
-parser.add_argument(
-    "--accum_steps",
-    type=int,
-    default=5,
-    help="Gradient accumulation steps. Effective batch size = batch_size * accum_steps.",
-)
+parser.add_argument('--run_name',type=str, default="resnet50roi2level")
+parser.add_argument('--accum_steps', type=int, default=5,
+                    help="Gradient accumulation steps. Effective batch size = batch_size * accum_steps.")
 
 args = parser.parse_args()
-
-if not args.run_name:
-    args.run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-_base_dir = args.exp_root if args.exp_root else "."
-_logs_root = os.path.join(_base_dir, "logs")
-_saved_root = os.path.join(_base_dir, "saved")
-
-log_dir = os.path.join(_logs_root, f"checkpoint_{args.model}_{args.run_name}")
-log_file_path = os.path.join(log_dir, "train_log.txt")
-check_dirs(log_dir)
+log_file_path = os.path.join("./logs",f'checkpoint_{args.model}_{args.run_name}',"train_log.txt")
+check_dirs(os.path.join("./logs",f'checkpoint_{args.model}_{args.run_name}'))
 logtxt(log_file_path, str(vars(args)))
 
 
-def build_checkpoint_meta():
-    pretrain_rel = "food2k_resnet101_0.0001.pth"
-    pretrain_path = os.path.abspath(pretrain_rel) if os.path.isfile(pretrain_rel) else ""
-    return {
-        "run_name": args.run_name,
-        "model": args.model,
-        "pretrained_backbone": "food2k_resnet101" if pretrain_path else "",
-        "pretrained_path": pretrain_path,
-        "args": vars(args),
-    }
+def get_save_dir():
+    return f"./saved/regression_{args.model}_{args.run_name}"
 
 
-_CKPT_META = build_checkpoint_meta()
+def get_auto_resume_path(save_dir):
+    ckpt_last = os.path.join(save_dir, "ckpt_last.pth")
+    if os.path.isfile(ckpt_last):
+        return ckpt_last
+    segments = []
+    if os.path.isdir(save_dir):
+        for fname in os.listdir(save_dir):
+            if fname.startswith("ckpt_segment_") and fname.endswith(".pth"):
+                try:
+                    epoch_num = int(fname[len("ckpt_segment_"):-4])
+                except ValueError:
+                    continue
+                segments.append((epoch_num, os.path.join(save_dir, fname)))
+    if segments:
+        segments.sort(key=lambda x: x[0], reverse=True)
+        return segments[0][1]
+    return ""
 
 
 
 def main():
-    # validation/segment settings
+    global best_loss
     val_every = 5
-    segment_size = 50  # 6 segments for 300 epochs
-    save_dir = os.path.join(_saved_root, f"regression_{args.model}_{args.run_name}")
-    check_dirs(save_dir)
-
+    segment_size = 50
     #global args
     #model = LightCNN_V4()
     # model = MyResNet(Bottleneck, [3, 4, 6, 3])  # 这里具体的参数参考库中源代码
     # model.load_state_dict(torch.load('resnet50-19c8e357.pth'), strict=False)
-    ingredients_dim = 255 if args.ingredients_mode == "binary255" else 512
-    model = MyResNetRGBD(ingredients_dim=ingredients_dim)
+    model = MyResNetRGBD()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device)
 
@@ -133,19 +105,23 @@ def main():
     #                             weight_decay=args.weight_decay)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
-    # optionally resume from a checkpoint
-    start_epoch = args.start_epoch
-    resume_path = args.resume if args.resume else get_resume_path(save_dir)
+    # optionally resume from a checkpoint; auto-resume from ckpt_last when --resume is empty
+    savepath = get_save_dir()
+    check_dirs(savepath)
+    resume_path = args.resume if args.resume else get_auto_resume_path(savepath)
     if resume_path:
         if os.path.isfile(resume_path):
             print("=> loading checkpoint '{}'".format(resume_path))
-            checkpoint = torch.load(resume_path)
-            start_epoch = checkpoint.get('epoch', checkpoint.get('epoch_idx', 0))
+            checkpoint = torch.load(resume_path, map_location=device)
             model.load_state_dict(checkpoint['state_dict'])
             if 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
                 optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(resume_path, start_epoch))
+            if 'best_loss' in checkpoint:
+                best_loss = checkpoint['best_loss']
+            if 'epoch' in checkpoint:
+                args.start_epoch = int(checkpoint['epoch'])
+            print("=> loaded checkpoint '{}' (resume from epoch {})"
+                  .format(resume_path, args.start_epoch))
         else:
             print("=> no checkpoint found at '{}'".format(resume_path))
 
@@ -159,35 +135,36 @@ def main():
 
     criterion = criterion.to(device)
 
-    for epoch in range(start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
-        train(
-            train_loader,
-            model,
-            criterion,
-            optimizer,
-            device,
-            epoch,
-        )
+    #criterion_2 = nn.MSELoss(size_average = False)
+    #criterion_2 = nn.MSELoss()
+    criterion_2 = nn.L1Loss()
+    criterion_2 = criterion_2.to(device)
 
+
+    for epoch in range(args.start_epoch, args.epochs):
+        adjust_learning_rate(optimizer, epoch)
+        train(train_loader, model, criterion, criterion_2, optimizer, device, epoch)
         do_validate = ((epoch + 1) % val_every == 0) or (epoch + 1 == args.epochs)
         if do_validate:
-            validate(test_loader, model, criterion, device, epoch, save_dir, optimizer)
-        save_checkpoint({
+            validate(test_loader, model, criterion, device, epoch, optimizer)
+
+        # always save latest checkpoint for interruption/resume
+        state_last = {
             'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'epoch': epoch + 1,
-            "meta": _CKPT_META,
-        }, os.path.join(save_dir, "ckpt_last.pth"))
+            'best_loss': best_loss,
+        }
+        torch.save(state_last, os.path.join(savepath, "ckpt_last.pth"))
         if (epoch + 1) % segment_size == 0:
-            save_checkpoint({
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch + 1,
-                "meta": _CKPT_META,
-            }, os.path.join(save_dir, f"ckpt_segment_{epoch + 1}.pth"))
+            torch.save(state_last, os.path.join(savepath, f"ckpt_segment_{epoch + 1}.pth"))
 
-def train(train_loader, model, criterion, optimizer, device, epoch):
+
+        #scheduler.step()
+        # evaluate on validation set
+        #prec1 = validate(test_loader, model, criterion, device)
+
+def train(train_loader, model, criterion, criterion_2, optimizer, device, epoch):
     model.train()
     train_loss = 0
     calories_loss = 0
@@ -195,6 +172,7 @@ def train(train_loader, model, criterion, optimizer, device, epoch):
     fat_loss = 0
     carb_loss = 0
     protein_loss = 0
+    ingredients_loss = 0
 
     epoch_iterator = tqdm(train_loader,
                           desc="Training (X / X Steps) (loss=X.X)",
@@ -213,13 +191,17 @@ def train(train_loader, model, criterion, optimizer, device, epoch):
         inputs_rgbd = x[7].to(device)
         inputs_ingredients = x[8].to(device)
 
-        outputs = model(inputs, inputs_rgbd, inputs_ingredients)
+        outputs, rgb_fea_t = model(inputs, inputs_rgbd)
         total_calories_loss = total_calories.shape[0] * criterion(outputs[0], total_calories) / total_calories.sum().item()
         total_mass_loss = total_calories.shape[0] * criterion(outputs[1], total_mass) / total_mass.sum().item()
         total_fat_loss = total_calories.shape[0] * criterion(outputs[2], total_fat) / total_fat.sum().item()
         total_carb_loss = total_calories.shape[0] * criterion(outputs[3], total_carb) / total_carb.sum().item()
         total_protein_loss = total_calories.shape[0] * criterion(outputs[4], total_protein) / total_protein.sum().item()
-        loss = total_calories_loss + total_mass_loss + total_fat_loss + total_carb_loss + total_protein_loss
+        total_ingredients_loss = criterion_2(rgb_fea_t, inputs_ingredients)
+        #loss = total_calories_loss + total_mass_loss + total_fat_loss + total_carb_loss + total_protein_loss + 0.001 * total_ingredients_loss
+        loss = total_calories_loss + total_mass_loss + total_fat_loss + total_carb_loss + total_protein_loss + 0.001 * total_ingredients_loss
+
+        #loss = total_calories_loss + total_mass_loss + total_fat_loss + total_carb_loss + total_protein_loss
 
         (loss / accum_steps).backward()
         do_step = ((batch_idx + 1) % accum_steps == 0) or (batch_idx + 1 == len(train_loader))
@@ -233,6 +215,7 @@ def train(train_loader, model, criterion, optimizer, device, epoch):
         fat_loss += total_fat_loss.item()
         carb_loss += total_carb_loss.item()
         protein_loss += total_protein_loss.item()
+        ingredients_loss += total_ingredients_loss.item()
 
         if (batch_idx+1) % args.print_freq == 0 or batch_idx+1 == len(train_loader):
             logtxt(log_file_path, 'Epoch: [{}][{}/{}]\t'
@@ -241,17 +224,19 @@ def train(train_loader, model, criterion, optimizer, device, epoch):
                     'massloss: {:2.5f} \t'
                     'fatloss: {:2.5f} \t'
                     'carbloss: {:2.5f} \t'
-                    'proteinloss: {:2.5f} \n'.format(
+                    'proteinloss: {:2.5f} \t'
+                    'ingredientsloss: {:2.5f} \n'.format(
                     epoch, batch_idx+1, len(train_loader),
                     train_loss/(batch_idx+1),
                     calories_loss/(batch_idx+1),
                     mass_loss/(batch_idx+1),
                     fat_loss/(batch_idx+1),
                     carb_loss/(batch_idx+1),
-                    protein_loss/(batch_idx+1)))
+                    protein_loss/(batch_idx+1),
+                    ingredients_loss/(batch_idx+1)))
 
 best_loss = 10000
-def validate(test_loader, model, criterion, device, epoch, save_dir, optimizer=None):
+def validate(test_loader, model, criterion, device, epoch, optimizer=None):
     # switch to evaluate mode
     global best_loss
     model.eval()
@@ -276,9 +261,8 @@ def validate(test_loader, model, criterion, device, epoch, save_dir, optimizer=N
             total_carb = x[5].to(device).float()
             total_protein = x[6].to(device).float()
             inputs_rgbd = x[7].to(device)
-            inputs_ingredients = x[8].to(device)
 
-            outputs = model(inputs, inputs_rgbd, inputs_ingredients)
+            outputs,_ = model(inputs, inputs_rgbd)
 
             # loss
             calories_total_loss = total_calories.shape[0] * criterion(outputs[0], total_calories) / total_calories.sum().item()
@@ -324,9 +308,11 @@ def validate(test_loader, model, criterion, device, epoch, save_dir, optimizer=N
             'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict() if optimizer is not None else None,
             'epoch': epoch,
-            "meta": _CKPT_META,
+            'best_loss': best_loss,
         }
-        save_checkpoint(state, os.path.join(save_dir, "ckpt_best.pth"))
+        savepath = get_save_dir()
+        check_dirs(savepath)
+        torch.save(state, os.path.join(savepath, f"ckpt_best.pth"))
 
 def adjust_learning_rate(optimizer, epoch):
     scale = 0.5
@@ -337,28 +323,6 @@ def adjust_learning_rate(optimizer, epoch):
         print('Change lr')
         for param_group in optimizer.param_groups:
             param_group['lr'] = param_group['lr'] * scale
-
-def save_checkpoint(state, filename):
-    torch.save(state, filename)
-
-def get_resume_path(save_dir):
-    ckpt_last = os.path.join(save_dir, "ckpt_last.pth")
-    if os.path.isfile(ckpt_last):
-        return ckpt_last
-    if not os.path.isdir(save_dir):
-        return None
-    segments = []
-    for fname in os.listdir(save_dir):
-        if fname.startswith("ckpt_segment_") and fname.endswith(".pth"):
-            try:
-                epoch_num = int(fname[len("ckpt_segment_"):-4])
-            except ValueError:
-                continue
-            segments.append((epoch_num, os.path.join(save_dir, fname)))
-    if not segments:
-        return None
-    segments.sort(key=lambda x: x[0], reverse=True)
-    return segments[0][1]
 
 if __name__ == '__main__':
     main()
