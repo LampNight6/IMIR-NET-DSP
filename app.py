@@ -423,24 +423,38 @@ def _scan_examples(examples_dir: Union[str, Path] = "examples") -> List[List[Any
     return rows
 
 
-def _lookup_ground_truth(rgb_path: str, depth_path: str) -> Optional[Dict[str, float]]:
+def _resolve_if_pathlike(value: Any) -> Optional[str]:
+    """仅当输入是路径类型时解析为绝对路径；其余类型返回 None。"""
+    if isinstance(value, (str, Path)) and value:
+        try:
+            return str(Path(value).resolve())
+        except Exception:
+            return None
+    return None
+
+
+def _lookup_ground_truth(
+    rgb_path: Union[str, Path, Image.Image, np.ndarray],
+    depth_path: Union[str, Path, Image.Image, np.ndarray],
+) -> Optional[Dict[str, float]]:
     """根据当前输入图像路径查找对应样例真值（如果存在）。"""
-    if not rgb_path or not depth_path:
+    rgb_abs = _resolve_if_pathlike(rgb_path)
+    depth_abs = _resolve_if_pathlike(depth_path)
+    if not rgb_abs or not depth_abs:
         return None
-    key = (str(Path(rgb_path).resolve()), str(Path(depth_path).resolve()))
-    return _EXAMPLE_GT_MAP.get(key)
+    return _EXAMPLE_GT_MAP.get((rgb_abs, depth_abs))
 
 
-def _load_ground_truth_from_info(info_path: str) -> Optional[Dict[str, float]]:
+def _load_ground_truth_from_info(info_path: Union[str, Path]) -> Optional[Dict[str, float]]:
     """优先根据样例 info.json 读取真值。"""
-    if not info_path:
+    info_abs = _resolve_if_pathlike(info_path)
+    if not info_abs:
         return None
 
-    resolved = str(Path(info_path).resolve())
-    if resolved in _EXAMPLE_INFO_GT_MAP:
-        return _EXAMPLE_INFO_GT_MAP[resolved]
+    if info_abs in _EXAMPLE_INFO_GT_MAP:
+        return _EXAMPLE_INFO_GT_MAP[info_abs]
 
-    p = Path(info_path)
+    p = Path(info_abs)
     if not p.is_file():
         return None
 
@@ -574,10 +588,10 @@ def _build_bar_plot(pred: Dict[str, float], gt: Optional[Dict[str, float]] = Non
 
 
 def _predict_for_ui(
-    rgb_image_path: str,
-    depth_image_path: str,
+    rgb_image_path: Union[str, Path, Image.Image, np.ndarray],
+    depth_image_path: Union[str, Path, Image.Image, np.ndarray],
     selected_ingredients: List[str],
-    sample_info_path: str,
+    sample_info_path: Union[str, Path],
 ):
     """Gradio 按钮回调：输入校验 + 推理 + 表格/图像输出。"""
     if gr is None:
