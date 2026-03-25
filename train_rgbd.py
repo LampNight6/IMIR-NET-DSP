@@ -56,6 +56,8 @@ parser.add_argument('--save_path', default='', type=str, metavar='PATH',
 parser.add_argument('--run_name',type=str, default="resnet50roi2level")
 parser.add_argument('--accum_steps', type=int, default=5,
                     help="Gradient accumulation steps. Effective batch size = batch_size * accum_steps.")
+parser.add_argument('--resume_optimizer', type=int, default=1, choices=[0, 1],
+                    help='Whether to load optimizer state when resuming (1=yes, 0=no).')
 
 args = parser.parse_args()
 log_file_path = os.path.join("./logs",f'checkpoint_{args.model}_{args.run_name}',"train_log.txt")
@@ -86,6 +88,13 @@ def get_auto_resume_path(save_dir):
     return ""
 
 
+def move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+
+
 
 def main():
     global best_loss
@@ -103,7 +112,13 @@ def main():
     # optimizer = torch.optim.SGD(model.parameters(), args.lr,
     #                             momentum=args.momentum,
     #                             weight_decay=args.weight_decay)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # foreach=False lowers peak CUDA memory during optimizer step/load.
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        foreach=False,
+    )
     #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
     # optionally resume from a checkpoint; auto-resume from ckpt_last when --resume is empty
     savepath = get_save_dir()
@@ -112,14 +127,20 @@ def main():
     if resume_path:
         if os.path.isfile(resume_path):
             print("=> loading checkpoint '{}'".format(resume_path))
-            checkpoint = torch.load(resume_path, map_location=device)
+            checkpoint = torch.load(resume_path, map_location='cpu')
             model.load_state_dict(checkpoint['state_dict'])
-            if 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
+            if args.resume_optimizer == 1 and 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
                 optimizer.load_state_dict(checkpoint['optimizer'])
+                move_optimizer_state_to_device(optimizer, device)
+            elif args.resume_optimizer == 0:
+                print("=> skip optimizer state on resume (--resume_optimizer=0)")
             if 'best_loss' in checkpoint:
                 best_loss = checkpoint['best_loss']
             if 'epoch' in checkpoint:
                 args.start_epoch = int(checkpoint['epoch'])
+            del checkpoint
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             print("=> loaded checkpoint '{}' (resume from epoch {})"
                   .format(resume_path, args.start_epoch))
         else:

@@ -1,89 +1,8 @@
-import torch
+﻿import torch
 import torch.nn as nn
-import clip
 from torchvision.models.resnet import Bottleneck, BasicBlock, conv1x1, conv3x3
 import torch.nn.functional as F
-
-class CLIPVisionBranch(nn.Module):
-    def __init__(self, clip_model_name: str = "RN101", assume_imagenet_normalized_input: bool = True):
-        super().__init__()
-        clip_model, _ = clip.load(clip_model_name, jit=False)
-        self.clip_model = clip_model
-        self.clip_model.to("cpu")
-        self.clip_model.eval()
-        self.clip_model.float()
-        for p in self.clip_model.parameters():
-            p.requires_grad = False
-
-        self.register_buffer(
-            "clip_mean",
-            torch.tensor([0.481, 0.457, 0.408], dtype=torch.float32).view(1, 3, 1, 1),
-        )
-        self.register_buffer(
-            "clip_std",
-            torch.tensor([0.268, 0.261, 0.275], dtype=torch.float32).view(1, 3, 1, 1),
-        )
-        self.register_buffer(
-            "imagenet_mean",
-            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
-        )
-        self.register_buffer(
-            "imagenet_std",
-            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
-        )
-        self.assume_imagenet_normalized_input = bool(assume_imagenet_normalized_input)
-
-        self._features = {}
-        self._hook_handles = []
-
-        def _save(name: str):
-            def _hook(_module, _inputs, output):
-                self._features[name] = output
-            return _hook
-
-        visual = self.clip_model.visual
-        self._hook_handles.append(visual.layer3.register_forward_hook(_save("s3")))
-        self._hook_handles.append(visual.layer4.register_forward_hook(_save("s4")))
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        self.clip_model.eval()
-        return self
-
-    def _forward_clip_visual_backbone(self, x: torch.Tensor) -> torch.Tensor:
-        visual = self.clip_model.visual
-        x = visual.conv1(x)
-        x = visual.bn1(x)
-        x = visual.relu1(x)
-        x = visual.conv2(x)
-        x = visual.bn2(x)
-        x = visual.relu2(x)
-        x = visual.conv3(x)
-        x = visual.bn3(x)
-        x = visual.relu3(x)
-        x = visual.avgpool(x)
-        x = visual.layer1(x)
-        x = visual.layer2(x)
-        x = visual.layer3(x)
-        x = visual.layer4(x)
-        return x
-
-    def forward(self, x_rgb: torch.Tensor):
-        x_rgb = x_rgb.float()
-        if self.assume_imagenet_normalized_input:
-            x_rgb = x_rgb * self.imagenet_std + self.imagenet_mean
-        x_rgb = x_rgb.clamp(0.0, 1.0)
-        x_rgb = (x_rgb - self.clip_mean) / self.clip_std
-
-        self._features.clear()
-        with torch.no_grad():
-            _ = self._forward_clip_visual_backbone(x_rgb)
-
-        clip_s3 = self._features.get("s3")
-        clip_s4 = self._features.get("s4")
-        if clip_s3 is None or clip_s4 is None:
-            raise RuntimeError("CLIPVisionBranch hooks did not capture layer3/layer4 features.")
-        return clip_s3.float(), clip_s4.float()
+from pytorch_wavelets import DWTForward, DWTInverse
 
 class CA_Enhance(nn.Module):
     def __init__(self, in_planes, ratio=16):
@@ -95,7 +14,7 @@ class CA_Enhance(nn.Module):
         self.relu1 = nn.ReLU()
         self.fc2 = nn.Conv2d(in_planes // 16, in_planes // 2, 1, bias=False)
 
-        self.sigmoid = nn.Sigmoid()
+        self.sigmoid = nn.Sigmoid() 
 
     def forward(self, rgb, depth):
         x = torch.cat((rgb, depth), dim=1)
@@ -136,6 +55,56 @@ class CA_SA_Enhance(nn.Module):
         sa = self.self_SA_Enhance(x_d)
         depth_enhance = depth.mul(sa)
         return depth_enhance
+
+
+class MBFM(nn.Module):
+    """
+    Multifrequency Bimodality Fusion Module (MBFM).
+
+    Uses DWT to split features into low/high frequency; discards depth high-frequency
+    components to suppress depth noise while keeping RGB texture details.
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        if in_channels % 2 != 0:
+            raise ValueError(f"MBFM expects even in_channels, got {in_channels}.")
+
+        hidden_channels = in_channels // 2
+
+        def cbr(in_ch: int, out_ch: int, k: int, padding: int):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=padding, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            )
+
+        self.rgb_reduce = cbr(in_channels, hidden_channels, k=1, padding=0)
+        self.depth_reduce = cbr(in_channels, hidden_channels, k=1, padding=0)
+
+        self.dwt = DWTForward(J=1, mode="zero", wave="haar")
+        self.idwt = DWTInverse(mode="zero", wave="haar")
+
+        self.rgb_ll_conv = cbr(hidden_channels, hidden_channels, k=3, padding=1)
+        self.depth_ll_conv = cbr(hidden_channels, hidden_channels, k=3, padding=1)
+
+        self.fuse_out = cbr(in_channels, in_channels, k=3, padding=1)
+
+    def forward(self, x_rgb: torch.Tensor, x_depth: torch.Tensor) -> torch.Tensor:
+        rgb_r = self.rgb_reduce(x_rgb)
+        depth_r = self.depth_reduce(x_depth)
+
+        rgb_ll, rgb_high = self.dwt(rgb_r)  # rgb_high: list length J
+        depth_ll, _depth_high = self.dwt(depth_r)
+
+        fused_ll = self.rgb_ll_conv(rgb_ll) + self.depth_ll_conv(depth_ll)
+
+        out_dwt = self.idwt((fused_ll, rgb_high))
+        if out_dwt.shape[-2:] != depth_r.shape[-2:]:
+            out_dwt = F.interpolate(out_dwt, size=depth_r.shape[-2:], mode="bilinear", align_corners=False)
+
+        fused = torch.cat([out_dwt, depth_r], dim=1)
+        return self.fuse_out(fused)
 
 class DilatedEncoder(nn.Module):
     """
@@ -386,19 +355,6 @@ class MyResNetRGBD(nn.Module):
         self.model_depth = MyResNet(Bottleneck, [3, 4, 23, 3])  # 这里具体的参数参考库中源代码
         self.model_depth.load_state_dict(torch.load('food2k_resnet101_0.0001.pth'), strict=False)
 
-        self.clip_branch = CLIPVisionBranch()
-        self.clip_fusion_s3 = nn.Sequential(
-            nn.Conv2d(in_channels=2048, out_channels=1024, kernel_size=1, bias=False),
-            nn.BatchNorm2d(1024),
-            nn.ReLU(inplace=True),
-        )
-        self.clip_fusion_s4 = nn.Sequential(
-            nn.Conv2d(in_channels=4096, out_channels=2048, kernel_size=1, bias=False),
-            nn.BatchNorm2d(2048),
-            nn.ReLU(inplace=True),
-        )
-        self.enable_clip_fusion = True
-
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         #self.fc1 = nn.Linear(1024, 256) #
         self.fc1 = nn.Linear(512, 256)  #
@@ -414,48 +370,14 @@ class MyResNetRGBD(nn.Module):
         self.encoder_l3_depth = DilatedEncoder(in_channels=1024)
         self.encoder_l4_depth = DilatedEncoder(in_channels=2048)
 
-        self.CA_SA_Enhance_3 = CA_SA_Enhance(2048)
-        self.CA_SA_Enhance_4 = CA_SA_Enhance(4096)
+        self.mbfm_l3 = MBFM(in_channels=1024)
+        self.mbfm_l4 = MBFM(in_channels=2048)
 
         self.con2d = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, padding=1, bias=True)
         self.relu = nn.ReLU(inplace=True)
 
         self.con2d_t = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, padding=1, bias=True)
         self.fc_t = nn.Linear(512,512)
-
-    def load_state_dict(self, state_dict, strict: bool = True):
-        if not strict:
-            incompatible = super().load_state_dict(state_dict, strict=False)
-            if not any(k.startswith("clip_fusion_s3.") or k.startswith("clip_fusion_s4.") for k in state_dict.keys()):
-                self.enable_clip_fusion = False
-            return incompatible
-
-        incompatible = super().load_state_dict(state_dict, strict=False)
-        if not any(k.startswith("clip_fusion_s3.") or k.startswith("clip_fusion_s4.") for k in state_dict.keys()):
-            self.enable_clip_fusion = False
-
-        allowed_missing_prefixes = (
-            "clip_branch.",
-            "clip_fusion_s3.",
-            "clip_fusion_s4.",
-        )
-        missing_keys = [k for k in incompatible.missing_keys if not any(k.startswith(p) for p in allowed_missing_prefixes)]
-        unexpected_keys = incompatible.unexpected_keys
-        if missing_keys or unexpected_keys:
-            error_msgs = []
-            if missing_keys:
-                error_msgs.append('Missing key(s) in state_dict: {}.'.format(', '.join('"{}"'.format(k) for k in missing_keys)))
-            if unexpected_keys:
-                error_msgs.append('Unexpected key(s) in state_dict: {}.'.format(', '.join('"{}"'.format(k) for k in unexpected_keys)))
-            raise RuntimeError("Error(s) in loading state_dict for {}:\n\t{}".format(self.__class__.__name__, "\n\t".join(error_msgs)))
-        return incompatible
-
-    def state_dict(self, *args, **kwargs):
-        state = super().state_dict(*args, **kwargs)
-        for k in list(state.keys()):
-            if k.startswith("clip_branch.clip_model."):
-                state.pop(k)
-        return state
 
     def forward(self, x_rgb, x_depth):
         x_fea = self.model_rgb.conv1(x_rgb)
@@ -465,20 +387,7 @@ class MyResNetRGBD(nn.Module):
 
         x_fea = self.model_rgb.layer1(x_fea)
         x_fea = self.model_rgb.layer2(x_fea)
-        rgb_s3 = self.model_rgb.layer3(x_fea)
-        rgb_s4 = self.model_rgb.layer4(rgb_s3)
-
-        if self.enable_clip_fusion:
-            clip_s3, clip_s4 = self.clip_branch(x_rgb)
-            if clip_s3.shape[-2:] != rgb_s3.shape[-2:]:
-                clip_s3 = F.interpolate(clip_s3, size=rgb_s3.shape[-2:], mode='bilinear', align_corners=False)
-            if clip_s4.shape[-2:] != rgb_s4.shape[-2:]:
-                clip_s4 = F.interpolate(clip_s4, size=rgb_s4.shape[-2:], mode='bilinear', align_corners=False)
-            l3_fea_rgb = self.clip_fusion_s3(torch.cat([rgb_s3, clip_s3], dim=1))
-            l4_fea_rgb = self.clip_fusion_s4(torch.cat([rgb_s4, clip_s4], dim=1))
-        else:
-            l3_fea_rgb = rgb_s3
-            l4_fea_rgb = rgb_s4
+        l3_fea_rgb = self.model_rgb.layer3(x_fea)
 
         ######################################
         x_fea_depth = self.model_depth.conv1(x_depth)
@@ -490,15 +399,14 @@ class MyResNetRGBD(nn.Module):
         x_fea_depth = self.model_depth.layer2(x_fea_depth)
         l3_fea_depth = self.model_depth.layer3(x_fea_depth)
 
-        # rgb refine depth
-        l3_fea_depth_rgb = self.CA_SA_Enhance_3(l3_fea_depth, l3_fea_rgb)
-        l3_fea_depth = l3_fea_depth + l3_fea_depth_rgb
+        # Layer 3 Fusion (RGB <- RGBD)
+        l3_fea_rgb = self.mbfm_l3(l3_fea_rgb, l3_fea_depth)
 
         l4_fea_depth = self.model_depth.layer4(l3_fea_depth)
+        l4_fea_rgb = self.model_rgb.layer4(l3_fea_rgb)
 
-        #depth refine rgb
-        l4_fea_rgb_depth = self.CA_SA_Enhance_4(l4_fea_rgb, l4_fea_depth)
-        l4_fea_rgb = l4_fea_rgb + l4_fea_rgb_depth
+        # Layer 4 Fusion (RGB <- RGBD)
+        l4_fea_rgb = self.mbfm_l4(l4_fea_rgb, l4_fea_depth)
 
 
         l3_fea_rgb_dilate = self.encoder_l3_rgb(l3_fea_rgb)
