@@ -31,6 +31,11 @@ _logger = logging.getLogger(__name__)
 
 
 def resize_pos_embed(posemb, posemb_new): # example: 224:(14x14+1)-> 384: (24x24+1)
+    """调整 ViT position embedding 的网格尺寸。
+
+    当预训练模型和当前模型输入分辨率不一致时，patch token 的二维位置编码
+    数量不同。这里保留 cls token，通过 bicubic 插值缩放 patch grid。
+    """
     # Rescale the grid of position embeddings when loading from state_dict. Adapted from
     # https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
     ntok_new = posemb_new.shape[1]
@@ -49,6 +54,11 @@ def resize_pos_embed(posemb, posemb_new): # example: 224:(14x14+1)-> 384: (24x24
     return posemb
 
 def load_state_dict(checkpoint_path, model, use_ema=False, num_classes=1000, del_posemb=False):
+    """读取预训练 checkpoint，并按当前模型需要清理/调整 key。
+
+    支持普通 state_dict、包含 state_dict/state_dict_ema 的训练 checkpoint，
+    可在类别数不同或 position embedding 不匹配时删除/插值相关权重。
+    """
     if checkpoint_path and os.path.isfile(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         state_dict_key = 'state_dict'
@@ -87,6 +97,7 @@ def load_state_dict(checkpoint_path, model, use_ema=False, num_classes=1000, del
 
 
 def load_for_transfer_learning(model, checkpoint_path, use_ema=False, strict=True, num_classes=1000):
+    """封装 transfer learning 权重加载流程。"""
     # state_dict = load_state_dict(checkpoint_path, use_ema, num_classes) lmj
     state_dict = load_state_dict(checkpoint_path, model, use_ema, num_classes)
     model.load_state_dict(state_dict, strict=strict)
@@ -94,6 +105,7 @@ def load_for_transfer_learning(model, checkpoint_path, use_ema=False, strict=Tru
 
 def get_mean_and_std(dataset):
     '''Compute the mean and std value of dataset.'''
+    # 逐样本统计三通道均值方差，用于生成数据集归一化参数。
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True, num_workers=2)
     mean = torch.zeros(3)
     std = torch.zeros(3)
@@ -108,6 +120,7 @@ def get_mean_and_std(dataset):
 
 def init_params(net):
     '''Init layer parameters.'''
+    # Conv/BN/Linear 使用常见初始化策略，适合从头训练的小模块。
     for m in net.modules():
         if isinstance(m, nn.Conv2d):
             init.kaiming_normal(m.weight, mode='fan_out')
@@ -129,6 +142,7 @@ TOTAL_BAR_LENGTH = 65.
 last_time = time.time()
 begin_time = last_time
 def progress_bar(current, total, msg=None):
+    """在终端绘制轻量进度条，兼容早期训练脚本。"""
     global last_time, begin_time
     if current == 0:
         begin_time = time.time()  # Reset for new bar.
@@ -172,6 +186,7 @@ def progress_bar(current, total, msg=None):
     sys.stdout.flush()
 
 def format_time(seconds):
+    """把秒数格式化成简短的人类可读时间。"""
     days = int(seconds / 3600/24)
     seconds = seconds - days*3600*24
     hours = int(seconds / 3600)
@@ -242,6 +257,7 @@ class WarmupConstantSchedule(LambdaLR):
         super(WarmupConstantSchedule, self).__init__(optimizer, self.lr_lambda, last_epoch=last_epoch)
 
     def lr_lambda(self, step):
+        # warmup 阶段线性升到 1，之后保持基础学习率不变。
         if step < self.warmup_steps:
             return float(step) / float(max(1.0, self.warmup_steps))
         return 1.
@@ -258,6 +274,7 @@ class WarmupLinearSchedule(LambdaLR):
         super(WarmupLinearSchedule, self).__init__(optimizer, self.lr_lambda, last_epoch=last_epoch)
 
     def lr_lambda(self, step):
+        # warmup 后按剩余训练步数线性衰减到 0。
         if step < self.warmup_steps:
             return float(step) / float(max(1, self.warmup_steps))
         return max(0.0, float(self.t_total - step) / float(max(1.0, self.t_total - self.warmup_steps)))
@@ -276,6 +293,7 @@ class WarmupCosineSchedule(LambdaLR):
         super(WarmupCosineSchedule, self).__init__(optimizer, self.lr_lambda, last_epoch=last_epoch)
 
     def lr_lambda(self, step):
+        # warmup 后按 cosine 曲线衰减；cycles 控制余弦周期比例。
         if step < self.warmup_steps:
             return float(step) / float(max(1.0, self.warmup_steps))
         # progress after warmup

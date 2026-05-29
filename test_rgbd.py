@@ -17,18 +17,28 @@ from mydataset import Nutrition_RGBD
 from mynetwork import MyResNetRGBD, MyResNetRGBDLegacy
 
 
+"""
+IMIR-Net RGB-D 推理与评估脚本。
+
+脚本根据 checkpoint 自动选择当前 fusion 模型、旧版 legacy 模型，或历史
+CA_SA+ingredients 模型；随后对测试集逐样本预测，并在 dish 级别聚合多帧/
+多视角结果，最后计算 PMAE = sum(|pred-gt|) / sum(gt) * 100。
+"""
+
 METRICS = ["calories", "mass", "fat", "carb", "protein"]
 HIST_CASA_ING_COMMIT = "8ed3b23"
 _HIST_MODULE_CACHE = {}
 
 
 def to_scalar(x):
+    """把 Tensor 或普通数值统一转成 Python float，方便 numpy/CSV 聚合。"""
     if isinstance(x, torch.Tensor):
         return float(x.detach().cpu().item())
     return float(x)
 
 
 def _strip_module_prefix(state_dict):
+    """去掉 DataParallel 保存权重时常见的 module. 前缀。"""
     if not isinstance(state_dict, (dict, OrderedDict)):
         return state_dict
     out = OrderedDict()
@@ -40,6 +50,12 @@ def _strip_module_prefix(state_dict):
 
 
 def load_checkpoint(model, checkpoint_path, device):
+    """加载 checkpoint 到指定模型。
+
+    该函数兼容训练 checkpoint {"state_dict": ...}、裸 state_dict 以及仅包含
+    Food2K backbone 的预训练权重。当前 main 路径主要使用 build_model_for_checkpoint，
+    这里保留给手动指定模型的场景。
+    """
     ckpt = torch.load(checkpoint_path, map_location=device)
 
     # Common training checkpoint format: {"epoch": ..., "state_dict": ...}
@@ -79,6 +95,7 @@ def load_checkpoint(model, checkpoint_path, device):
 
 
 def _extract_state_dict(ckpt):
+    """从训练 checkpoint 或裸权重中抽取统一的 state_dict。"""
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         return _strip_module_prefix(ckpt["state_dict"])
     if isinstance(ckpt, (dict, OrderedDict)):
@@ -87,6 +104,7 @@ def _extract_state_dict(ckpt):
 
 
 def _infer_ingredients_dim_from_state_dict(state_dict):
+    """通过 ingredients_fc1.weight 的输入维度判断 checkpoint 需要的食材向量维度。"""
     w = state_dict.get("ingredients_fc1.weight")
     if isinstance(w, torch.Tensor) and w.dim() == 2:
         return int(w.shape[1])
@@ -94,10 +112,12 @@ def _infer_ingredients_dim_from_state_dict(state_dict):
 
 
 def _has_prefix(state_dict, prefixes):
+    """检查权重 key 中是否存在指定模块前缀，用于自动识别模型变体。"""
     return any(isinstance(k, str) and k.startswith(prefixes) for k in state_dict.keys())
 
 
 def _load_historical_mynetwork_module(commit):
+    """从 git 历史中加载旧版 mynetwork.py，兼容早期 CA_SA+ingredients checkpoint。"""
     if commit in _HIST_MODULE_CACHE:
         return _HIST_MODULE_CACHE[commit]
     try:
@@ -116,6 +136,7 @@ def _load_historical_mynetwork_module(commit):
 
 
 def _build_historical_casa_ingredients_model(ingredients_dim, device):
+    """实例化历史版本中的 MyResNetRGBD。"""
     hist_module = _load_historical_mynetwork_module(HIST_CASA_ING_COMMIT)
     model_cls = getattr(hist_module, "MyResNetRGBD", None)
     if model_cls is None:
@@ -126,6 +147,13 @@ def _build_historical_casa_ingredients_model(ingredients_dim, device):
 
 
 def build_model_for_checkpoint(args, device):
+    """根据 checkpoint key 自动选择并加载匹配的模型定义。
+
+    判断依据：
+    - 有 ingredients_fc/fusion_fc：说明 checkpoint 接收食材输入。
+    - 有 CA_SA_Enhance 且没有 MBFM：说明属于历史 CA_SA+ingredients 版本。
+    - 没有食材融合头：使用 legacy RGB-D 模型。
+    """
     ckpt = torch.load(args.checkpoint, map_location=device)
     state_dict = _extract_state_dict(ckpt)
     has_ing_fusion_head = _has_prefix(state_dict, ("ingredients_fc1.", "fusion_fc."))
@@ -167,6 +195,7 @@ def build_model_for_checkpoint(args, device):
         model.load_state_dict(payload, strict=True)
     except RuntimeError as e:
         print(f"[WARN] load_state_dict(strict=True) failed: {e}")
+        # strict=False 仍会因 shape mismatch 报错，所以先过滤掉尺寸不匹配的权重。
         # Remove incompatible shapes (strict=False still errors on size mismatch).
         model_sd = model.state_dict()
         filtered = {k: v for k, v in payload.items() if k in model_sd and getattr(v, "shape", None) == getattr(model_sd[k], "shape", None)}
@@ -183,6 +212,7 @@ def build_model_for_checkpoint(args, device):
 
 
 def main():
+    """推理主流程：构建 Dataset/DataLoader，预测，dish 级聚合并输出 PMAE/CSV。"""
     parser = argparse.ArgumentParser(description="IMIR-Net RGB-D inference")
     parser.add_argument("--data_root", type=str, required=True, help="Dataset root containing imagery/")
     parser.add_argument("--checkpoint", type=str, default="./saved/ckpt_best.pth", help="Path to checkpoint .pth")
@@ -227,6 +257,7 @@ def main():
     model.eval()
 
     # For fusion checkpoints, auto-align dataset ingredients format/dim to checkpoint.
+    # checkpoint 的 ingredients_fc1 输入维度优先级最高，避免命令行参数与权重不一致。
     dataset_ingredients_mode = inferred_ingredients_mode if variant in ("fusion", "ca_sa_ingredients") else args.ingredients_mode
     dataset_ingredients_dim = (inferred_ingredients_dim if inferred_ingredients_dim is not None else (255 if dataset_ingredients_mode == "binary255" else 512))
 
@@ -263,6 +294,7 @@ def main():
 
     with torch.no_grad():
         for _, x in enumerate(epoch_iterator):
+            # Dataset 字段顺序与训练保持一致；推理时 label/dish_id 用于 dish 级聚合。
             inputs = x[0].to(device)
             total_calories = x[2].to(device).float().view(-1)
             total_mass = x[3].to(device).float().view(-1)
@@ -273,6 +305,7 @@ def main():
             inputs_ingredients = x[8].to(device)
 
             if variant == "legacy":
+                # legacy forward 不接收食材向量，并可能返回 (results, aux_feature)。
                 out = model(inputs, inputs_rgbd)
                 outputs = out[0] if isinstance(out, (tuple, list)) and len(out) == 2 else out
             else:
@@ -280,6 +313,7 @@ def main():
 
             preds = []
             for k in range(5):
+                # batch_size=1 时 squeeze 后可能是 0 维 Tensor，这里统一恢复成一维。
                 out_k = outputs[k]
                 if isinstance(out_k, torch.Tensor) and out_k.dim() == 0:
                     out_k = out_k.view(1)
@@ -294,6 +328,7 @@ def main():
             bs = int(total_calories.shape[0])
             for i in range(bs):
                 dish_id = str(ids[i])
+                # 同一个 dish 可能有多帧/多视角，先累加，后面再取平均。
                 pred = np.array([to_scalar(preds[k][i]) for k in range(5)], dtype=np.float64)
                 gt = np.array(
                     [
@@ -312,12 +347,14 @@ def main():
                 gt_cnt[dish_id] = gt_cnt.get(dish_id, 0) + 1
 
     dishes = sorted(set(pred_sum.keys()) & set(gt_sum.keys()))
+    # 按 dish 平均后再评估，避免多视角样本数量影响单道菜权重。
     pred_mean = {d: (pred_sum[d] / max(1, pred_cnt[d])) for d in dishes}
     gt_mean = {d: (gt_sum[d] / max(1, gt_cnt[d])) for d in dishes}
 
     # PMAE definition (the one you validated earlier): sum(|pred-gt|)/sum(gt) * 100, dish-level.
     pmae = {}
     for j, name in enumerate(METRICS):
+        # PMAE 按指标分别计算：所有 dish 的绝对误差总和 / 真值总和。
         se = 0.0
         sg = 0.0
         for d in dishes:

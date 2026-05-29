@@ -6,7 +6,24 @@ import torch.nn.functional as F
 from pytorch_wavelets import DWTForward, DWTInverse
 
 
+"""
+IMIR-Net 的核心网络定义。
+
+本文件包含 RGB-D 双分支 ResNet、CLIP 视觉特征补充、频域融合模块 MBFM、
+膨胀卷积编码器以及营养指标回归头。整体 forward 路径是：
+RGB/Depth 图像 -> 双分支特征提取 -> CLIP/RGB 与 RGB-D 融合 -> 多尺度特征聚合
+-> 食材向量门控 -> 输出 calories/mass/fat/carb/protein 五个回归结果。
+"""
+
+
 class CLIPVisionBranch(nn.Module):
+    """冻结的 CLIP RN 视觉分支，用来提供额外的语义视觉特征。
+
+    主模型训练时不会更新 CLIP 参数，只通过 forward hook 取出 layer3/layer4
+    中间特征。输入默认已按 ImageNet 均值方差归一化，因此进入 CLIP 前先反
+    归一化到 [0, 1]，再按 CLIP 自己的均值方差归一化。
+    """
+
     def __init__(self, clip_model_name: str = "RN101", assume_imagenet_normalized_input: bool = True):
         super().__init__()
         clip_model, _ = clip.load(clip_model_name, jit=False)
@@ -40,6 +57,7 @@ class CLIPVisionBranch(nn.Module):
 
         def _save(name: str):
             def _hook(_module, _inputs, output):
+                # forward hook 保存指定 stage 的特征，避免改动 CLIP 原始 forward。
                 self._features[name] = output
 
             return _hook
@@ -50,10 +68,12 @@ class CLIPVisionBranch(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
+        # 即使外部调用 model.train()，CLIP 仍保持 eval，避免 BN/统计量变化。
         self.clip_model.eval()
         return self
 
     def _forward_clip_visual_backbone(self, x: torch.Tensor) -> torch.Tensor:
+        """只执行 CLIP ResNet 的卷积骨干，跳过最终 attention pool/head。"""
         visual = self.clip_model.visual
         x = visual.conv1(x)
         x = visual.bn1(x)
@@ -74,8 +94,10 @@ class CLIPVisionBranch(nn.Module):
     def forward(self, x_rgb: torch.Tensor):
         x_rgb = x_rgb.float()
         if self.assume_imagenet_normalized_input:
+            # 数据集 transform 使用 ImageNet normalize，这里恢复到图像值域。
             x_rgb = x_rgb * self.imagenet_std + self.imagenet_mean
         x_rgb = x_rgb.clamp(0.0, 1.0)
+        # CLIP 使用不同的均值方差；这里转换到 CLIP 预训练分布。
         x_rgb = (x_rgb - self.clip_mean) / self.clip_std
 
         self._features.clear()
@@ -89,6 +111,12 @@ class CLIPVisionBranch(nn.Module):
         return clip_s3.float(), clip_s4.float()
 
 class CA_Enhance(nn.Module):
+    """通道注意力增强模块。
+
+    将 RGB 与 depth 特征在通道维拼接，通过全局池化生成 depth 通道权重，
+    用于旧版模型中的跨模态 depth 增强。
+    """
+
     def __init__(self, in_planes, ratio=16):
         super(CA_Enhance, self).__init__()
 
@@ -112,6 +140,8 @@ class CA_Enhance(nn.Module):
         return depth
 
 class SA_Enhance(nn.Module):
+    """空间注意力增强模块，根据通道最大响应生成单通道空间权重图。"""
+
     def __init__(self, kernel_size=7):
         super(SA_Enhance, self).__init__()
 
@@ -128,6 +158,8 @@ class SA_Enhance(nn.Module):
         return self.sigmoid(x)
 
 class CA_SA_Enhance(nn.Module):
+    """旧版 CA + SA 组合模块，先做通道增强，再做空间增强。"""
+
     def __init__(self, in_planes, ratio=16):
         super(CA_SA_Enhance, self).__init__()
 
@@ -147,6 +179,10 @@ class MBFM(nn.Module):
 
     Uses DWT to split features into low/high frequency; discards depth high-frequency
     components to suppress depth noise while keeping RGB texture details.
+
+    输入的 RGB/depth 特征通道数相同，先各自降到一半通道，再做 Haar 小波
+    分解。低频部分融合 RGB 与 depth 的结构信息，高频部分仅保留 RGB，
+    以减少深度图噪声对纹理细节的影响。最后逆小波重建并与 depth 降维特征拼接。
     """
 
     def __init__(self, in_channels: int):
@@ -175,9 +211,11 @@ class MBFM(nn.Module):
         self.fuse_out = cbr(in_channels, in_channels, k=3, padding=1)
 
     def forward(self, x_rgb: torch.Tensor, x_depth: torch.Tensor) -> torch.Tensor:
+        # 先用 1x1 卷积压缩通道，控制小波域融合的计算量。
         rgb_r = self.rgb_reduce(x_rgb)
         depth_r = self.depth_reduce(x_depth)
 
+        # DWT 返回低频 LL 和高频 LH/HL/HH；这里只保留 RGB 高频。
         rgb_ll, rgb_high = self.dwt(rgb_r)  # rgb_high: list length J
         depth_ll, _depth_high = self.dwt(depth_r)
 
@@ -185,6 +223,7 @@ class MBFM(nn.Module):
 
         out_dwt = self.idwt((fused_ll, rgb_high))
         if out_dwt.shape[-2:] != depth_r.shape[-2:]:
+            # 奇数尺寸经过 DWT/IDWT 可能产生一像素差异，回到 depth 特征尺寸。
             out_dwt = F.interpolate(out_dwt, size=depth_r.shape[-2:], mode="bilinear", align_corners=False)
 
         fused = torch.cat([out_dwt, depth_r], dim=1)
@@ -235,6 +274,7 @@ class DilatedEncoder(nn.Module):
         encoder_blocks = []
         for i in range(self.num_residual_blocks):
             dilation = self.block_dilations[i]
+            # 不同 dilation 的残差块扩大感受野，保留特征图分辨率。
             encoder_blocks.append(
                 MyBottleneck(
                     self.encoder_channels,
@@ -267,12 +307,14 @@ class DilatedEncoder(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, feature: torch.Tensor) -> torch.Tensor:
+        # 先把 backbone 通道投影到 encoder_channels，再串联膨胀残差块。
         out = self.lateral_norm(self.lateral_conv(feature))
         out = self.fpn_norm(self.fpn_conv(out))
         return self.dilated_encoder_blocks(out)
 
 
 class MyBottleneck(nn.Module):
+    """DilatedEncoder 内部使用的轻量瓶颈残差块。"""
 
     def __init__(self,
                  in_channels: int = 512,
@@ -301,10 +343,13 @@ class MyBottleneck(nn.Module):
         out = self.conv1(x)
         out = self.conv2(out)
         out = self.conv3(out)
+        # 残差连接稳定深层膨胀卷积训练。
         out = out + identity
         return out
 
 class MyResNet(nn.Module):
+    """去掉分类头的 ResNet 骨干，返回 layer3/layer4 两级特征。"""
+
     def __init__(self, block, layers, num_classes=1000, zero_init_residual=False,
                  groups=1, width_per_group=64, replace_stride_with_dilation=None,
                  norm_layer=None):
@@ -329,6 +374,7 @@ class MyResNet(nn.Module):
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        # 标准 ResNet 四个 stage；本项目只使用后两级特征做营养回归。
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
                                        dilate=replace_stride_with_dilation[0])
@@ -371,6 +417,7 @@ class MyResNet(nn.Module):
         downsample = None
         previous_dilation = self.dilation
         if dilate:
+            # 用 dilation 替代 stride 时保持输出分辨率不再下采样。
             self.dilation *= stride
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
@@ -392,6 +439,7 @@ class MyResNet(nn.Module):
 
     def _forward_impl(self, x):
         # See note [TorchScript super()]
+        # stem + layer1/layer2 是共享的低中层纹理/形状特征提取。
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -431,6 +479,16 @@ class MyResNet(nn.Module):
         return self._forward_impl(x)
 
 class MyResNetRGBD(nn.Module):
+    """当前 RGB-D + 食材信息融合模型。
+
+    主要组成：
+    1. RGB 与 depth 各一套 Food2K 预训练 ResNet101 backbone。
+    2. 可选 CLIP 视觉分支补充 RGB 语义特征。
+    3. MBFM 在 layer3/layer4 上融合 RGB 与 depth。
+    4. DilatedEncoder 聚合多尺度上下文。
+    5. 食材向量生成 visual gate，并与视觉向量拼接后回归五个营养指标。
+    """
+
     def __init__(self, ingredients_dim: int = 255):
         super(MyResNetRGBD, self).__init__()
         self.model_rgb = MyResNet(Bottleneck, [3, 4, 23, 3])  # 这里具体的参数参考库中源代码
@@ -439,6 +497,7 @@ class MyResNetRGBD(nn.Module):
         self.model_depth = MyResNet(Bottleneck, [3, 4, 23, 3])  # 这里具体的参数参考库中源代码
         self.model_depth.load_state_dict(torch.load('food2k_resnet101_0.0001.pth'), strict=False)
 
+        # CLIP 分支本身冻结，只训练后面的 1x1 融合层。
         self.clip_branch = CLIPVisionBranch()
         self.clip_fusion_s3 = nn.Sequential(
             nn.Conv2d(in_channels=2048, out_channels=1024, kernel_size=1, bias=False),
@@ -454,10 +513,12 @@ class MyResNetRGBD(nn.Module):
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.ingredients_dim = int(ingredients_dim)
+        # 食材输入可以是 512 维 CLIP 文本特征，也可以是 255 维二值食材向量。
         self.ingredients_fc1 = nn.Linear(self.ingredients_dim, 256)
         self.ingredients_fc2 = nn.Linear(256, 512)  # attention weights for 512-D visual vector (after GAP)
         self.fusion_fc = nn.Linear(512 + 256, 256)
 
+        # 五个独立回归头，对应 Nutrition5k 的总热量、质量、脂肪、碳水、蛋白质。
         self.calorie = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
         self.mass = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
         self.fat = nn.Sequential(nn.Linear(256, 256), nn.Linear(256, 1))
@@ -480,6 +541,11 @@ class MyResNetRGBD(nn.Module):
         self.fc_t = nn.Linear(512,512)
 
     def load_state_dict(self, state_dict, strict: bool = True):
+        """兼容旧 checkpoint。
+
+        旧权重中没有 CLIP 分支和融合层时，不把这些缺失 key 视为错误，
+        同时关闭 enable_clip_fusion，保证旧 checkpoint 仍能推理。
+        """
         if not strict:
             incompatible = super().load_state_dict(state_dict, strict=False)
             if not any(k.startswith("clip_fusion_s3.") or k.startswith("clip_fusion_s4.") for k in state_dict.keys()):
@@ -521,11 +587,13 @@ class MyResNetRGBD(nn.Module):
     def state_dict(self, *args, **kwargs):
         state = super().state_dict(*args, **kwargs)
         for k in list(state.keys()):
+            # CLIP 预训练参数不随 checkpoint 保存，减少文件体积并避免重复存储冻结权重。
             if k.startswith("clip_branch.clip_model."):
                 state.pop(k)
         return state
 
     def forward(self, x_rgb, x_depth, ingredients_vec):
+        # RGB backbone 显式展开到 layer3/layer4，便于插入 CLIP 与 RGB-D 融合模块。
         x_fea = self.model_rgb.conv1(x_rgb)
         x_fea = self.model_rgb.bn1(x_fea)
         x_fea = self.model_rgb.relu(x_fea)
@@ -537,6 +605,7 @@ class MyResNetRGBD(nn.Module):
         rgb_s4 = self.model_rgb.layer4(rgb_s3)
 
         if self.enable_clip_fusion:
+            # CLIP 与 ResNet 特征空间尺寸可能不同，先插值对齐后再按通道拼接。
             clip_s3, clip_s4 = self.clip_branch(x_rgb)
             if clip_s3.shape[-2:] != rgb_s3.shape[-2:]:
                 clip_s3 = F.interpolate(clip_s3, size=rgb_s3.shape[-2:], mode='bilinear', align_corners=False)
@@ -549,6 +618,7 @@ class MyResNetRGBD(nn.Module):
             l4_fea_rgb = rgb_s4
 
         ######################################
+        # depth backbone 与 RGB backbone 结构相同，输入是 depth_color 图像。
         x_fea_depth = self.model_depth.conv1(x_depth)
         x_fea_depth = self.model_depth.bn1(x_fea_depth)
         x_fea_depth = self.model_depth.relu(x_fea_depth)
@@ -559,6 +629,7 @@ class MyResNetRGBD(nn.Module):
         l3_fea_depth = self.model_depth.layer3(x_fea_depth)
 
         # Layer 3 Fusion (RGB <- RGBD)
+        # MBFM 输出仍保持 RGB stage 的通道数，后续继续作为主视觉特征。
         l3_fea_rgb = self.mbfm_l3(l3_fea_rgb, l3_fea_depth)
 
         l4_fea_depth = self.model_depth.layer4(l3_fea_depth)
@@ -572,10 +643,12 @@ class MyResNetRGBD(nn.Module):
 
         # l3_fea_rgb_pool = self.avgpool(l3_fea_rgb_dilate)
         # l4_fea_rgb_pool = self.avgpool(l4_fea_rgb_dilate)
+        # layer4 分辨率低于 layer3，上采样后和 layer3 特征拼接形成 1024 通道特征。
         l4_fea_rgb_dilate_up = torch.nn.functional.interpolate(l4_fea_rgb_dilate, scale_factor=2, mode='bilinear', align_corners=False)
         #rgb_fea = l3_fea_rgb_pool + l4_fea_rgb_pool_up
         rgb_fea_cat = torch.cat((l3_fea_rgb_dilate, l4_fea_rgb_dilate_up), dim=1)
         #print(rgb_fea.shape)
+        # con2d 将多尺度拼接特征压到 512 通道，再全局池化得到视觉向量。
         rgb_fea = self.con2d(rgb_fea_cat)
         rgb_fea = self.relu(rgb_fea)
         rgb_fea = self.avgpool(rgb_fea)
@@ -620,6 +693,7 @@ class MyResNetRGBD(nn.Module):
         visual_vec = torch.flatten(rgb_fea, 1)  # (B, 512)
         if isinstance(ingredients_vec, torch.Tensor) and ingredients_vec.dim() == 1:
             ingredients_vec = ingredients_vec.view(1, -1)
+        # 食材隐藏向量一方面作为独立语义特征，一方面生成视觉通道门控权重。
         ingredients_hidden = F.relu(self.ingredients_fc1(ingredients_vec.float()))  # (B, 256)
         attn = torch.sigmoid(self.ingredients_fc2(ingredients_hidden))  # (B, 512)
         visual_weighted = visual_vec * attn
@@ -638,6 +712,9 @@ class MyResNetRGBDLegacy(nn.Module):
     """
     Legacy IMIR-Net RGB-D model (no ingredient-as-input fusion).
     Use this to evaluate older checkpoints trained without ingredients gating.
+
+    该类保留旧 checkpoint 使用的 CA_SA 融合路径，forward 不接收
+    ingredients_vec。推理脚本会根据 checkpoint key 自动选择当前模型或旧模型。
     """
 
     def __init__(self):
@@ -673,6 +750,7 @@ class MyResNetRGBDLegacy(nn.Module):
         self.fc_t = nn.Linear(512, 512)
 
     def forward(self, x_rgb, x_depth):
+        # 旧版路径：先分别提取 RGB 与 depth 的 layer3 特征。
         x_fea = self.model_rgb.conv1(x_rgb)
         x_fea = self.model_rgb.bn1(x_fea)
         x_fea = self.model_rgb.relu(x_fea)
@@ -691,6 +769,7 @@ class MyResNetRGBDLegacy(nn.Module):
         x_fea_depth = self.model_depth.layer2(x_fea_depth)
         l3_fea_depth = self.model_depth.layer3(x_fea_depth)
 
+        # CA_SA 先用 RGB/depth 互相生成注意力，再以残差形式增强 depth/RGB。
         l3_fea_depth_rgb = self.CA_SA_Enhance_3(l3_fea_depth, l3_fea_rgb)
         l3_fea_depth = l3_fea_depth + l3_fea_depth_rgb
 
@@ -720,6 +799,7 @@ class MyResNetRGBDLegacy(nn.Module):
         embedding = torch.flatten(rgb_fea, 1)
         embedding = self.fc1(embedding)
         embedding = F.relu(embedding)
+        # 返回五个营养回归结果，以及旧版训练中使用过的辅助视觉向量 rgb_fea_t。
         results = []
         results.append(self.calorie(embedding).squeeze())
         results.append(self.mass(embedding).squeeze())

@@ -22,6 +22,14 @@ import torchvision as tv
 from mynetwork import MyResNetRGBD
 from torchvision.models.resnet import Bottleneck, BasicBlock, conv1x1, conv3x3
 
+"""
+IMIR-Net RGB-D 训练入口。
+
+脚本负责解析实验参数、构建 MyResNetRGBD、恢复 checkpoint、执行训练/验证、
+记录日志并保存 last/best/segment checkpoint。训练目标是同时回归五个营养指标：
+calories、mass、fat、carb、protein。
+"""
+
 parser = argparse.ArgumentParser(description='PyTorch Light CNN Training')
 parser.add_argument('--arch', '-a', metavar='ARCH', default='LightCNN')
 parser.add_argument('--cuda', '-c', default=True)
@@ -85,6 +93,7 @@ args = parser.parse_args()
 if not args.run_name:
     args.run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+# 每次运行使用独立 run_name，避免覆盖已有日志和 checkpoint。
 _base_dir = args.exp_root if args.exp_root else "."
 _logs_root = os.path.join(_base_dir, "logs")
 _saved_root = os.path.join(_base_dir, "saved")
@@ -96,6 +105,7 @@ logtxt(log_file_path, str(vars(args)))
 
 
 def build_checkpoint_meta():
+    """保存 checkpoint 时附带实验元信息，方便之后追踪权重来源和参数。"""
     pretrain_rel = "food2k_resnet101_0.0001.pth"
     pretrain_path = os.path.abspath(pretrain_rel) if os.path.isfile(pretrain_rel) else ""
     return {
@@ -112,6 +122,7 @@ _CKPT_META = build_checkpoint_meta()
 
 
 def main():
+    """训练主流程：构建模型/优化器、恢复断点、循环训练并定期验证保存。"""
     # validation/segment settings
     val_every = 5
     segment_size = 50  # 6 segments for 300 epochs
@@ -123,6 +134,7 @@ def main():
     # model = MyResNet(Bottleneck, [3, 4, 6, 3])  # 这里具体的参数参考库中源代码
     # model.load_state_dict(torch.load('resnet50-19c8e357.pth'), strict=False)
     ingredients_dim = 255 if args.ingredients_mode == "binary255" else 512
+    # 模型的 ingredients_dim 必须和 Dataset 返回的 ingredients_tensor 维度一致。
     model = MyResNetRGBD(ingredients_dim=ingredients_dim)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device)
@@ -135,15 +147,26 @@ def main():
     #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
     # optionally resume from a checkpoint
     start_epoch = args.start_epoch
+    # 若 --resume 未指定，则优先从当前 run 的 ckpt_last/最新 segment 自动续训。
     resume_path = args.resume if args.resume else get_resume_path(save_dir)
     if resume_path:
         if os.path.isfile(resume_path):
             print("=> loading checkpoint '{}'".format(resume_path))
-            checkpoint = torch.load(resume_path)
+            # Load checkpoint tensors on CPU first to avoid a temporary extra GPU copy.
+            checkpoint = torch.load(resume_path, map_location='cpu')
             start_epoch = checkpoint.get('epoch', checkpoint.get('epoch_idx', 0))
             model.load_state_dict(checkpoint['state_dict'])
             if 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
                 optimizer.load_state_dict(checkpoint['optimizer'])
+                # Ensure optimizer states are on the same device as model params.
+                if device == 'cuda':
+                    for state in optimizer.state.values():
+                        for k, v in state.items():
+                            if torch.is_tensor(v):
+                                state[k] = v.to(device, non_blocking=True)
+            del checkpoint
+            if device == 'cuda':
+                torch.cuda.empty_cache()
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(resume_path, start_epoch))
         else:
@@ -155,6 +178,7 @@ def main():
     train_loader, test_loader = get_DataLoader(args)
 
     # define loss function and optimizer
+    # 单项营养指标使用 L1Loss，后续会按 batch 中该指标总量归一化。
     criterion = nn.L1Loss()
 
     criterion = criterion.to(device)
@@ -173,6 +197,7 @@ def main():
         do_validate = ((epoch + 1) % val_every == 0) or (epoch + 1 == args.epochs)
         if do_validate:
             validate(test_loader, model, criterion, device, epoch, save_dir, optimizer)
+        # 每个 epoch 保存 last，保证意外中断后能从最近一轮继续。
         save_checkpoint({
             'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -180,6 +205,7 @@ def main():
             "meta": _CKPT_META,
         }, os.path.join(save_dir, "ckpt_last.pth"))
         if (epoch + 1) % segment_size == 0:
+            # segment checkpoint 用于保留阶段性权重，便于回溯不同训练区间。
             save_checkpoint({
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -188,6 +214,7 @@ def main():
             }, os.path.join(save_dir, f"ckpt_segment_{epoch + 1}.pth"))
 
 def train(train_loader, model, criterion, optimizer, device, epoch):
+    """训练一个 epoch，并把五个营养回归损失写入日志。"""
     model.train()
     train_loss = 0
     calories_loss = 0
@@ -201,9 +228,11 @@ def train(train_loader, model, criterion, optimizer, device, epoch):
                           bar_format="{l_bar}{r_bar}",
                           dynamic_ncols=True)
     accum_steps = max(int(getattr(args, "accum_steps", 1)), 1)
+    # 梯度累积用于在显存较小的情况下模拟更大的有效 batch size。
     optimizer.zero_grad(set_to_none=True)
     for batch_idx, x in enumerate(epoch_iterator):  # (inputs, targets,ingredient)
         '''Portion Independent Model'''
+        # Dataset 返回字段顺序固定：RGB、label、五个营养真值、depth/RGB-D、食材向量。
         inputs = x[0].to(device)
         total_calories = x[2].to(device).float()
         total_mass = x[3].to(device).float()
@@ -214,6 +243,7 @@ def train(train_loader, model, criterion, optimizer, device, epoch):
         inputs_ingredients = x[8].to(device)
 
         outputs = model(inputs, inputs_rgbd, inputs_ingredients)
+        # loss = batch_size * MAE / batch内真值总量，相当于相对误差形式的 PMAE 近似。
         total_calories_loss = total_calories.shape[0] * criterion(outputs[0], total_calories) / total_calories.sum().item()
         total_mass_loss = total_calories.shape[0] * criterion(outputs[1], total_mass) / total_mass.sum().item()
         total_fat_loss = total_calories.shape[0] * criterion(outputs[2], total_fat) / total_fat.sum().item()
@@ -224,6 +254,7 @@ def train(train_loader, model, criterion, optimizer, device, epoch):
         (loss / accum_steps).backward()
         do_step = ((batch_idx + 1) % accum_steps == 0) or (batch_idx + 1 == len(train_loader))
         if do_step:
+            # 只在累积步数到达时更新参数；最后一个不完整累积段也会更新。
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -252,6 +283,7 @@ def train(train_loader, model, criterion, optimizer, device, epoch):
 
 best_loss = 10000
 def validate(test_loader, model, criterion, device, epoch, save_dir, optimizer=None):
+    """在验证集上计算同训练口径的归一化 L1 损失，并保存 best checkpoint。"""
     # switch to evaluate mode
     global best_loss
     model.eval()
@@ -281,6 +313,7 @@ def validate(test_loader, model, criterion, device, epoch, save_dir, optimizer=N
             outputs = model(inputs, inputs_rgbd, inputs_ingredients)
 
             # loss
+            # 验证损失口径与训练保持一致，便于 best_loss 直接比较。
             calories_total_loss = total_calories.shape[0] * criterion(outputs[0], total_calories) / total_calories.sum().item()
             mass_total_loss = total_calories.shape[0] * criterion(outputs[1], total_mass) / total_mass.sum().item()
             fat_total_loss = total_calories.shape[0] * criterion(outputs[2], total_fat) / total_fat.sum().item()
@@ -318,6 +351,7 @@ def validate(test_loader, model, criterion, device, epoch, save_dir, optimizer=N
         # Save checkpoint.
         # pdb.set_trace()
     if best_loss > test_loss:
+        # 这里 best_loss 使用整个验证集累计 loss；只要更低就覆盖 ckpt_best。
         best_loss = test_loss
         print('Saving..')
         state = {
@@ -329,6 +363,7 @@ def validate(test_loader, model, criterion, device, epoch, save_dir, optimizer=N
         save_checkpoint(state, os.path.join(save_dir, "ckpt_best.pth"))
 
 def adjust_learning_rate(optimizer, epoch):
+    """每 step 个 epoch 将学习率乘以 scale。"""
     scale = 0.5
     step  = 45
     lr = args.lr * (scale ** (epoch // step))
@@ -339,9 +374,11 @@ def adjust_learning_rate(optimizer, epoch):
             param_group['lr'] = param_group['lr'] * scale
 
 def save_checkpoint(state, filename):
+    """保存模型、优化器、epoch 和 meta 信息。"""
     torch.save(state, filename)
 
 def get_resume_path(save_dir):
+    """自动选择续训 checkpoint：优先 ckpt_last，其次最新的 ckpt_segment_xxx。"""
     ckpt_last = os.path.join(save_dir, "ckpt_last.pth")
     if os.path.isfile(ckpt_last):
         return ckpt_last
