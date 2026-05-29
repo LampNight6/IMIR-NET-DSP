@@ -1,0 +1,37 @@
+[
+  {
+    "sample": "sample_001",
+    "dish_id": "dish_1566838286",
+    "ingredient_count": 1,
+    "rgb_src": "D:\\CodeProject\\IMIR-Net\\data with dish grounding\\realsense_overhead\\realsense_overhead\\dish_1566838286\\rgb_roi_v2.png",
+    "depth_src": "D:\\CodeProject\\IMIR-Net\\data with dish grounding\\realsense_overhead\\realsense_overhead\\dish_1566838286\\depth_color_roi_v2.png"
+  },
+  {
+    "sample": "sample_002",
+    "dish_id": "dish_1560800951",
+    "ingredient_count": 9,
+    "rgb_src": "D:\\CodeProject\\IMIR-Net\\data with dish grounding\\realsense_overhead\\realsense_overhead\\dish_1560800951\\rgb_roi_v2.png",
+    "depth_src": "D:\\CodeProject\\IMIR-Net\\data with dish grounding\\realsense_overhead\\realsense_overhead\\dish_1560800951\\depth_color_roi_v2.png"
+  },
+  {
+    "sample": "sample_003",
+    "dish_id": "dish_1564687013",
+    "ingredient_count": 16,
+    "rgb_src": "D:\\CodeProject\\IMIR-Net\\data with dish grounding\\realsense_overhead\\realsense_overhead\\dish_1564687013\\rgb_roi_v2.png",
+    "depth_src": "D:\\CodeProject\\IMIR-Net\\data with dish grounding\\realsense_overhead\\realsense_overhead\\dish_1564687013\\depth_color_roi_v2.png"
+  },
+  {
+    "sample": "sample_004",
+    "dish_id": "dish_1561148021",
+    "ingredient_count": 23,
+    "rgb_src": "D:\\CodeProject\\IMIR-Net\\data with dish grounding\\realsense_overhead\\realsense_overhead\\dish_1561148021\\rgb_roi_v2.png",
+    "depth_src": "D:\\CodeProject\\IMIR-Net\\data with dish grounding\\realsense_overhead\\realsense_overhead\\dish_1561148021\\depth_color_roi_v2.png"
+  },
+  {
+    "sample": "sample_005",
+    "dish_id": "dish_1563565508",
+    "ingredient_count": 31,
+    "rgb_src": "D:\\CodeProject\\IMIR-Net\\data with dish grounding\\realsense_overhead\\realsense_overhead\\dish_1563565508\\rgb_roi_v2.png",
+    "depth_src": "D:\\CodeProject\\IMIR-Net\\data with dish grounding\\realsense_overhead\\realsense_overhead\\dish_1563565508\\depth_color_roi_v2.png"
+  }
+]

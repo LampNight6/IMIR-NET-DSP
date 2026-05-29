@@ -1,0 +1,21 @@
+{
+  "dish_id": "dish_1560800951",
+  "ingredients": [
+    "bulgur",
+    "cauliflower",
+    "chickpeas",
+    "kale",
+    "lemon juice",
+    "olive oil",
+    "parsley",
+    "pepper",
+    "salt"
+  ],
+  "ground_truth": {
+    "calories": 102.825645,
+    "mass": 168.0,
+    "fat": 4.309042,
+    "carb": 14.129096,
+    "protein": 4.287562
+  }
+}
